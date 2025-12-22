@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+outputs/
+artifacts/
+checkpoints/
+logs/
+
+# Data
+data/
+
+
+

@@ -1,0 +1,37 @@
+data:
+  source: bucket
+  bucket_root: /home/ubuntu/qwen-image-layered/data/rgba_layers
+  bucket_split: train
+  batch_size: 1
+  num_workers: 2
+  shuffle: true
+  limit: 8
+  background_blend_prob: 0.0
+  background_sample_prob: 0.0
+
+training:
+  stage: rgba_vae
+  learning_rate: 1e-4
+  epochs: 1
+  ckpt_dir: checkpoints/smoke_rgba_vae_clean
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+  log_every: 1
+  run_validation: false
+  val_every_steps: 500
+  ckpt_every_steps: 5000
+  max_grad_norm: 1.0
+
+model:
+  name: rgba_vae
+  base_arch: qwen
+  beta: 0.25
+  alpha_loss_weight: 1.0
+  alpha_l1_weight: 0.0
+  rgb_loss_weight: 1.0
+  white_bg_loss_weight: 0.5
+  black_bg_loss_weight: 0.5
+  rgb_checkpoint: /home/ubuntu/qwen-image-layered/checkpoints/rgba_vae_init
+  rgb_subfolder: null
+  alpha_bias_init: 0.0
+  torch_dtype: float32

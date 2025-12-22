@@ -1,0 +1,14 @@
+torch
+diffusers
+transformers
+accelerate
+numpy
+scipy
+pillow
+matplotlib
+pyyaml
+tqdm
+opencv-python
+safetensors
+lpips>=0.1.4
+

@@ -1,0 +1,49 @@
+data:
+  source: bucket  # bucket or multilayer
+  bucket_root: /home/ubuntu/jjseol/layer_data/qwen_rgba_layers
+  bucket_split: train
+  batch_size: 2
+  num_workers: 4
+  shuffle: true
+  background_blend_prob: 0.1
+  background_blend_targets:
+    - component
+    - composite
+  background_color_range: [0.3, 0.9]
+  background_sample_prob: 0.05
+
+training:
+  stage: rgba_vae  # options: rgba_vae, decompose, refine
+  # placeholders for future hyperparameters
+  learning_rate: 1e-4
+  epochs: 10
+  ckpt_dir: checkpoints
+  gradient_accumulation_steps: 1
+
+  mixed_precision: "bf16"  # options: no, fp16, bf16
+  log_every: 50
+  run_validation: true
+  val_every_steps: 500
+  val_max_batches: 10
+  val_visual_rows: 8
+  val_output_dir: outputs/val
+  val_background_colors:
+    - white
+    - black
+  ckpt_every_steps: 5000
+  max_grad_norm: 1.0
+
+model:
+  name: rgba_vae
+  base_arch: qwen  # options: qwen, flux
+  beta: 0.25
+  alpha_loss_weight: 1.0
+  alpha_l1_weight: 0.0
+  rgb_loss_weight: 1.0
+  white_bg_loss_weight: 0.5
+  black_bg_loss_weight: 0.5
+  rgb_checkpoint: /home/ubuntu/qwen-image-layered/checkpoints/rgba_vae_init
+  rgb_subfolder: null  # override if weights are stored under a subfolder
+  alpha_bias_init: 0.0
+  torch_dtype: float32
+

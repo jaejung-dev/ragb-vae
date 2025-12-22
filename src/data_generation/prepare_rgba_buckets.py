@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""
+Prepare RGBA component + composite pairs for RGBA-VAE training using resolution buckets.
+
+Each saved sample now contains:
+- Component RGBA layer (resized to bucket dims)
+- Corresponding composite RGBA (same sample, same bucket)
+
+Counts are based on number of components (train/train_count, val/val_count).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import multiprocessing as mp
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import binary_erosion
+from tqdm import tqdm
+
+# Defaults align with previous data pipelines
+DEFAULT_RENDERED_ROOT = Path("/home/ubuntu/jjseol/layer_data/inpainting_250k_subset_rendered")
+DEFAULT_OUTPUT_ROOT = Path("/home/ubuntu/qwen-image-layered/data/rgba_layers")
+
+# Lower bounds to keep each resized sample <=1.1M pixels (lighter batches).
+MAX_SIDE = 1408
+MAX_PIXELS = 1408 * 768
+MULTIPLE = 32
+MIN_BUCKET_SIDE = MULTIPLE
+FILTER_MIN_SIDE = 256
+FILTER_MAX_AR = 2.3
+
+
+_WORKER_STATE: Dict[str, Any] | None = None
+_TRAIN_COUNTER: Optional["mp.Value"] = None
+_VAL_COUNTER: Optional["mp.Value"] = None
+_COUNTER_LOCK: Optional[mp.Lock] = None
+
+
+def find_component_paths(sample_dir: Path) -> List[Path]:
+    patterns = [
+        "component_*.png",
+        f"{sample_dir.name}_component_*.png",
+        "*_component_*.png",
+    ]
+    for pattern in patterns:
+        indexed: List[Tuple[int, Path]] = []
+        for path in sample_dir.glob(pattern):
+            if "thumbnail" in path.name.lower():
+                continue
+            stem_parts = path.stem.split("_")
+            numeric = next((part for part in reversed(stem_parts) if part.isdigit()), None)
+            if numeric is None:
+                continue
+            indexed.append((int(numeric), path))
+        if indexed:
+            indexed.sort(key=lambda item: item[0])
+            return [p for _, p in indexed]
+    return []
+
+
+def load_rgba(path: Path) -> Image.Image:
+    with Image.open(path) as img:
+        return img.convert("RGBA")
+
+
+def round_to_multiple(value: float, multiple: int = MULTIPLE) -> int:
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def should_exclude_size(width: int, height: int) -> Optional[str]:
+    smaller = min(width, height)
+    larger = max(width, height)
+    if smaller < FILTER_MIN_SIDE:
+        return "too_small"
+    if larger / max(1, smaller) >= FILTER_MAX_AR:
+        return "extreme_aspect_ratio"
+    return None
+
+
+def bucket_for_size(width: int, height: int) -> Tuple[int, int]:
+    scale_side = min(MAX_SIDE / width, MAX_SIDE / height, 1.0)
+    scale_pixels = min(math.sqrt(MAX_PIXELS / float(width * height)), 1.0)
+    scale = min(scale_side, scale_pixels)
+    sw, sh = width * scale, height * scale
+    bucket_w = max(round_to_multiple(sw), MIN_BUCKET_SIDE)
+    bucket_h = max(round_to_multiple(sh), MIN_BUCKET_SIDE)
+    return int(bucket_w), int(bucket_h)
+
+
+def bucket_assignment(size: Tuple[int, int]) -> Tuple[Optional[Tuple[str, Tuple[int, int]]], Optional[str]]:
+    w, h = size
+    if w <= 0 or h <= 0:
+        return None, "invalid_dimensions"
+    reason = should_exclude_size(w, h)
+    if reason:
+        return None, reason
+    bucket_dims = bucket_for_size(w, h)
+    bucket_key = f"w{bucket_dims[0]}-h{bucket_dims[1]}"
+    return (bucket_key, bucket_dims), None
+
+
+def resolve_background_path(sample_dir: Path) -> Path:
+    direct = sample_dir / "background.png"
+    if direct.exists():
+        return direct
+    prefixed = sample_dir / f"{sample_dir.name}_background.png"
+    if prefixed.exists():
+        return prefixed
+    for candidate in sorted(sample_dir.glob("*_background.png")):
+        if "thumbnail" in candidate.name.lower():
+            continue
+        return candidate
+    raise FileNotFoundError(f"Background not found for {sample_dir}")
+
+
+def composite_layers(background: Image.Image, components: Sequence[Image.Image]) -> Image.Image:
+    composite = background.convert("RGBA")
+    for layer in components:
+        composite = Image.alpha_composite(composite, layer.convert("RGBA"))
+    return composite
+
+
+def save_component(
+    img: Image.Image,
+    split: str,
+    sample_name: str,
+    comp_idx: int,
+    bucket_name: str,
+    bucket_dims: Tuple[int, int],
+    output_root: Path,
+) -> Path:
+    bucket_root = output_root / split / bucket_name
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    filename = f"{sample_name}_fg{comp_idx:03d}.png"
+    out_path = bucket_root / filename
+    resized = img.resize(bucket_dims, resample=Image.LANCZOS)
+    resized.save(out_path)
+    return out_path.relative_to(output_root)
+
+
+
+def _component_alpha_mask(image: Image.Image) -> np.ndarray:
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    alpha = np.asarray(image, dtype=np.uint8)[..., 3]
+    return alpha > 0
+
+
+def _build_component_masks(components: Sequence[Image.Image]) -> Dict[int, np.ndarray]:
+    masks: Dict[int, np.ndarray] = {}
+    for idx, image in enumerate(components):
+        mask = _component_alpha_mask(image)
+        if np.any(mask):
+            masks[idx] = mask
+    return masks
+
+
+def _erode_masks(masks: Dict[int, np.ndarray], iterations: int) -> Dict[int, np.ndarray]:
+    if iterations <= 0:
+        return {idx: mask.copy() for idx, mask in masks.items()}
+    structure = np.ones((3, 3), dtype=bool)
+    eroded: Dict[int, np.ndarray] = {}
+    for idx, mask in masks.items():
+        eroded_mask = binary_erosion(mask, structure=structure, iterations=iterations)
+        if not np.any(eroded_mask):
+            eroded_mask = mask.copy()
+        eroded[idx] = eroded_mask
+    return eroded
+
+
+def _find_unoverlapped_indices(remaining: Sequence[int], eroded_masks: Dict[int, np.ndarray]) -> List[int]:
+    if not remaining:
+        return []
+    sample_mask = next(iter(eroded_masks.values()))
+    covered = np.zeros_like(sample_mask, dtype=bool)
+    picks: List[int] = []
+    for idx in reversed(remaining):
+        mask = eroded_masks.get(idx)
+        if mask is None:
+            continue
+        if not np.any(mask & covered):
+            picks.append(idx)
+            covered |= mask
+    picks.reverse()
+    return picks
+
+
+def _composite_subset(components: Sequence[Image.Image], indices: Sequence[int], canvas_size: Tuple[int, int]) -> Image.Image:
+    fg = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    for idx in indices:
+        fg = Image.alpha_composite(fg, components[idx].convert("RGBA"))
+    return fg
+
+
+def iterate_foreground_groups(
+    background: Image.Image,
+    components: Sequence[Image.Image],
+    *,
+    erosion_iterations: int,
+    max_groups: Optional[int],
+):
+    masks = _build_component_masks(components)
+    if not masks:
+        return
+    eroded_masks = _erode_masks(masks, iterations=erosion_iterations)
+    remaining = [idx for idx in range(len(components)) if idx in masks]
+    stage = 0
+    while remaining:
+        picks = _find_unoverlapped_indices(remaining, eroded_masks)
+        if not picks:
+            break
+        base_image = composite_layers(background, [components[idx] for idx in remaining])
+        fg_image = _composite_subset(components, picks, background.size)
+        yield stage, picks, base_image, fg_image
+        remaining = [idx for idx in remaining if idx not in picks]
+        stage += 1
+        if max_groups is not None and stage >= max_groups:
+            break
+
+
+def _claim_split_mp() -> Optional[str]:
+    if _COUNTER_LOCK is None or _TRAIN_COUNTER is None or _VAL_COUNTER is None:
+        raise RuntimeError("Multiprocessing counters are not initialized.")
+    with _COUNTER_LOCK:
+        if _TRAIN_COUNTER.value > 0:
+            _TRAIN_COUNTER.value -= 1
+            return "train"
+        if _VAL_COUNTER.value > 0:
+            _VAL_COUNTER.value -= 1
+            return "val"
+        return None
+
+
+def _init_worker(state: Dict[str, Any], train_counter, val_counter, lock) -> None:
+    global _WORKER_STATE, _TRAIN_COUNTER, _VAL_COUNTER, _COUNTER_LOCK
+    _WORKER_STATE = state
+    _TRAIN_COUNTER = train_counter
+    _VAL_COUNTER = val_counter
+    _COUNTER_LOCK = lock
+
+
+def _worker_process(sample_dir: Path) -> List[Dict[str, Any]]:
+    if (
+        _TRAIN_COUNTER is not None
+        and _VAL_COUNTER is not None
+        and _TRAIN_COUNTER.value <= 0
+        and _VAL_COUNTER.value <= 0
+    ):
+        return []
+    try:
+        return _process_sample(sample_dir)
+    except Exception:  # noqa: BLE001
+        logging.exception("Failed to process %s", sample_dir)
+        return []
+
+
+def _process_sample(
+    sample_dir: Path,
+    state: Optional[Dict[str, Any]] = None,
+    claim_split: Optional[Callable[[], Optional[str]]] = None,
+) -> List[Dict[str, Any]]:
+    active_state = state or _WORKER_STATE
+    if active_state is None:
+        raise RuntimeError("Worker state is not initialized.")
+
+    component_paths = find_component_paths(sample_dir)
+    if not component_paths:
+        return []
+
+    with Image.open(resolve_background_path(sample_dir)) as bg:
+        background = bg.convert("RGBA")
+    component_images = [load_rgba(path) for path in component_paths]
+
+    assignment, reason = bucket_assignment(background.size)
+    if assignment is None:
+        logging.debug("Skipping %s due to bucket exclusion: %s", sample_dir.name, reason)
+        return []
+    bucket_name, bucket_dims = assignment
+
+    groups: List[Tuple[int, List[int], Image.Image, Image.Image]] = []
+    for stage_idx, picks, base_image, fg_image in iterate_foreground_groups(
+        background,
+        component_images,
+        erosion_iterations=active_state["fg_erosion_iterations"],
+        max_groups=active_state["fg_max_groups"],
+    ):
+        groups.append((stage_idx, list(picks), base_image, fg_image))
+
+    if not groups:
+        return []
+
+    splitter = claim_split or _claim_split_mp
+    split = splitter()
+    if split is None:
+        logging.debug("Capacity reached; skipping sample %s", sample_dir.name)
+        return []
+
+    output_root = Path(active_state["output_root"])
+    composite_candidate = output_root / split / bucket_name / f"{sample_dir.name}_fg000_composite.png"
+    if composite_candidate.exists():
+        logging.debug("Sample %s already processed for %s; skipping", sample_dir.name, split)
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    composite_rel: Optional[str] = None
+    composite_stage: Optional[int] = None
+
+    for stage_idx, group_indices, base_image, fg_image in groups:
+        comp_rel = save_component(
+            fg_image,
+            split=split,
+            sample_name=sample_dir.name,
+            comp_idx=stage_idx,
+            bucket_name=bucket_name,
+            bucket_dims=bucket_dims,
+            output_root=output_root,
+        )
+        if composite_rel is None:
+            composite_rel = save_composite(
+                base_image,
+                split=split,
+                sample_name=sample_dir.name,
+                comp_idx=stage_idx,
+                bucket_name=bucket_name,
+                bucket_dims=bucket_dims,
+                output_root=output_root,
+            )
+            composite_stage = stage_idx
+        fg_size = list(fg_image.size)
+        entries.append(
+            {
+                "split": split,
+                "bucket": bucket_name,
+                "bucket_dims": list(bucket_dims),
+                "component_path": str(comp_rel),
+                "composite_path": str(composite_rel),
+                "source_sample": sample_dir.name,
+                "component_index": stage_idx,
+                "composite_stage": composite_stage,
+                "group_size": len(group_indices),
+                "group_indices": group_indices,
+                "original_size": fg_size,
+            }
+        )
+        base_image.close()
+        fg_image.close()
+
+    logging.info(
+        "Processed %s -> %s (groups=%d)", sample_dir.name, split, len(entries)
+    )
+    return entries
+
+
+
+def save_composite(
+    composite: Image.Image,
+    split: str,
+    sample_name: str,
+    comp_idx: int,
+    bucket_name: str,
+    bucket_dims: Tuple[int, int],
+    output_root: Path,
+) -> Path:
+    bucket_root = output_root / split / bucket_name
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    out_path = bucket_root / f"{sample_name}_fg{comp_idx:03d}_composite.png"
+    composite.resize(bucket_dims, resample=Image.LANCZOS).save(out_path)
+    return out_path.relative_to(output_root)
+
+
+def write_manifest(records: List[Dict[str, Any]], manifest_path: Path) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+
+def _flatten_structure(records: List[Dict[str, Any]], output_root: Path) -> None:
+    """
+    Ensure component/composite files live directly under bucket directories and
+    update manifest paths accordingly.
+    """
+    for entry in records:
+        split = entry["split"]
+        bucket = entry["bucket"]
+        bucket_root = output_root / split / bucket
+        bucket_root.mkdir(parents=True, exist_ok=True)
+
+        comp_name = Path(entry["component_path"]).name
+        comp_dst = bucket_root / comp_name
+        comp_candidates = [
+            output_root / entry["component_path"],
+            bucket_root / "components" / comp_name,
+        ]
+        for src in comp_candidates:
+            if src.exists():
+                if src != comp_dst:
+                    comp_dst.parent.mkdir(parents=True, exist_ok=True)
+                    src.replace(comp_dst)
+                break
+        entry["component_path"] = str(Path(split) / bucket / comp_name)
+
+        sample_name = entry["source_sample"]
+        raw_composite_name = Path(entry["composite_path"]).name
+        composite_name = raw_composite_name if raw_composite_name.endswith("_composite.png") else f"{sample_name}_composite.png"
+        compo_dst = bucket_root / composite_name
+        compo_candidates = [
+            output_root / entry["composite_path"],
+            bucket_root / "composite" / raw_composite_name,
+        ]
+        for src in compo_candidates:
+            if src.exists():
+                if src != compo_dst:
+                    compo_dst.parent.mkdir(parents=True, exist_ok=True)
+                    src.replace(compo_dst)
+                break
+        entry["composite_path"] = str(Path(split) / bucket / composite_name)
+
+    # Remove empty legacy directories
+    for split_dir in (output_root / "train", output_root / "val"):
+        if not split_dir.exists():
+            continue
+        for bucket_dir in split_dir.iterdir():
+            if not bucket_dir.is_dir():
+                continue
+            for legacy in ("components", "composite"):
+                legacy_dir = bucket_dir / legacy
+                if legacy_dir.exists() and legacy_dir.is_dir():
+                    for child in legacy_dir.iterdir():
+                        child.unlink()
+                    legacy_dir.rmdir()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bucket RGBA component layers for VAE training.")
+    parser.add_argument("--rendered-root", type=Path, default=DEFAULT_RENDERED_ROOT)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--train-count", type=int, default=1000, help="Target number of training composites (one composite per sample).")
+    parser.add_argument("--val-count", type=int, default=50, help="Target number of validation composites (one composite per sample).")
+    parser.add_argument("--fg-max-groups", type=int, default=None, help="Optional cap on the number of foreground groups to emit per sample.")
+    parser.add_argument("--fg-erosion-iterations", type=int, default=1, help="3x3 erosion iterations before overlap grouping (default: 1).")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of worker processes to use for sample generation.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on sample directories.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    sample_dirs = sorted(d for d in args.rendered_root.iterdir() if d.is_dir())
+    if args.max_samples is not None:
+        sample_dirs = sample_dirs[: args.max_samples]
+
+    rng = np.random.default_rng(args.seed)
+    indices = np.arange(len(sample_dirs))
+    rng.shuffle(indices)
+    shuffled_dirs = [sample_dirs[i] for i in indices]
+
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    state = {
+        "output_root": str(output_root),
+        "fg_max_groups": args.fg_max_groups,
+        "fg_erosion_iterations": args.fg_erosion_iterations,
+    }
+
+    manifest_records: List[Dict[str, Any]] = []
+
+    if args.num_workers <= 1:
+        train_remaining = args.train_count
+        val_remaining = args.val_count
+
+        def claim_split_local() -> Optional[str]:
+            nonlocal train_remaining, val_remaining
+            if train_remaining > 0:
+                train_remaining -= 1
+                return "train"
+            if val_remaining > 0:
+                val_remaining -= 1
+                return "val"
+            return None
+
+        for sample_dir in tqdm(shuffled_dirs, desc="Processing samples"):
+            if train_remaining <= 0 and val_remaining <= 0:
+                break
+            entries = _process_sample(sample_dir, state, claim_split_local)
+            manifest_records.extend(entries)
+    else:
+        train_counter = mp.Value("i", args.train_count)
+        val_counter = mp.Value("i", args.val_count)
+        lock = mp.Lock()
+        pool = mp.Pool(
+            processes=args.num_workers,
+            initializer=_init_worker,
+            initargs=(state, train_counter, val_counter, lock),
+        )
+        terminated = False
+        try:
+            iterator = pool.imap_unordered(_worker_process, shuffled_dirs)
+            for entries in tqdm(iterator, total=len(shuffled_dirs), desc="Processing samples"):
+                manifest_records.extend(entries)
+                if train_counter.value <= 0 and val_counter.value <= 0:
+                    pool.terminate()
+                    terminated = True
+                    break
+        finally:
+            if not terminated:
+                pool.close()
+            pool.join()
+        train_remaining = train_counter.value
+        val_remaining = val_counter.value
+
+    if train_remaining > 0 or val_remaining > 0:
+        logging.warning(
+            "Did not reach requested counts (train_remaining=%d, val_remaining=%d)",
+            train_remaining,
+            val_remaining,
+        )
+
+    _flatten_structure(manifest_records, output_root)
+    manifest_path = output_root / "metadata" / "manifest.json"
+    write_manifest(manifest_records, manifest_path)
+    logging.info("Manifest written to %s with %d entries.", manifest_path, len(manifest_records))
+
+
+if __name__ == "__main__":
+    main()
+

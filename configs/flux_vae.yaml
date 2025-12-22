@@ -1,0 +1,59 @@
+data:
+  source: bucket
+  bucket_root: /home/ubuntu/jjseol/layer_data/rgba_layers
+  bucket_split: train
+  batch_size: 1
+  num_workers: 16
+  shuffle: true
+  background_blend_prob: 0.1
+  background_blend_targets:
+    - component
+    - composite
+  background_color_range: [0.3, 0.9]
+  background_sample_prob: 0.05
+  val_shuffle: true
+
+
+training:
+  stage: rgba_vae
+  learning_rate: 1e-5
+  epochs: 10
+  ckpt_dir: checkpoints/flux_rgba_vae
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+  log_every: 50
+  run_validation: true
+  val_every_steps: 200
+  val_max_batches: 100
+  val_visual_rows: 16
+  val_output_dir: outputs/val_flux
+  val_background_colors:
+    - white
+    - black
+  ckpt_every_steps: 2000
+  max_grad_norm: 1.0
+  vae_slicing: true
+  vae_gradient_checkpointing: true
+  kl_scale: 1.0e-6
+  ref_kl_scale: 1.0e-16
+  lpips_scale: 0.5
+  loss_reduce_mean: true
+  use_naive_mse: false
+  deepspeed_config: configs/deepspeed_zero2.json
+
+model:
+  name: rgba_vae
+  base_arch: flux
+  beta: 0.25
+  alpha_loss_weight: 1.0
+  alpha_l1_weight: 0.0
+  rgb_loss_weight: 1.0
+  white_bg_loss_weight: 0.5
+  black_bg_loss_weight: 0.5
+  rgb_checkpoint: /home/ubuntu/qwen-image-layered/checkpoints/flux_rgba_vae_init
+  rgb_subfolder: ""
+  ref_rgb_checkpoint: null
+  ref_rgb_subfolder: null
+  alpha_bias_init: 0.0
+  torch_dtype: bfloat16
+
