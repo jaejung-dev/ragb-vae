@@ -17,7 +17,7 @@ import logging
 import math
 import multiprocessing as mp
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PIL import Image
@@ -27,6 +27,7 @@ from tqdm import tqdm
 # Defaults align with previous data pipelines
 DEFAULT_RENDERED_ROOT = Path("/home/ubuntu/jjseol/layer_data/inpainting_250k_subset_rendered")
 DEFAULT_OUTPUT_ROOT = Path("/home/ubuntu/qwen-image-layered/data/rgba_layers")
+DEFAULT_VALIDATION_LIST = Path("/home/ubuntu/ragb-vae/validation_list.txt")
 
 # Lower bounds to keep each resized sample <=1.1M pixels (lighter batches).
 MAX_SIDE = 1408
@@ -243,17 +244,30 @@ def iterate_foreground_groups(
             break
 
 
-def _claim_split_mp() -> Optional[str]:
+def _claim_split_mp(sample_name: str) -> Optional[str]:
     if _COUNTER_LOCK is None or _TRAIN_COUNTER is None or _VAL_COUNTER is None:
         raise RuntimeError("Multiprocessing counters are not initialized.")
-    with _COUNTER_LOCK:
+    validation_set = set(_WORKER_STATE.get("validation_set", [])) if _WORKER_STATE else set()
+
+    def take(split: str) -> Optional[str]:
+        if split == "val":
+            if _VAL_COUNTER.value == -1:
+                return "val"
+            if _VAL_COUNTER.value > 0:
+                _VAL_COUNTER.value -= 1
+                return "val"
+            return None
+        if _TRAIN_COUNTER.value == -1:
+            return "train"
         if _TRAIN_COUNTER.value > 0:
             _TRAIN_COUNTER.value -= 1
             return "train"
-        if _VAL_COUNTER.value > 0:
-            _VAL_COUNTER.value -= 1
-            return "val"
         return None
+
+    with _COUNTER_LOCK:
+        if validation_set and sample_name in validation_set:
+            return take("val")
+        return take("train")
 
 
 def _init_worker(state: Dict[str, Any], train_counter, val_counter, lock) -> None:
@@ -285,13 +299,11 @@ def _pick_component_by_alpha(
 
 
 def _worker_process(sample_dir: Path) -> List[Dict[str, Any]]:
-    if (
-        _TRAIN_COUNTER is not None
-        and _VAL_COUNTER is not None
-        and _TRAIN_COUNTER.value <= 0
-        and _VAL_COUNTER.value <= 0
-    ):
-        return []
+    if _TRAIN_COUNTER is not None and _VAL_COUNTER is not None:
+        train_exhausted = _TRAIN_COUNTER.value == 0
+        val_exhausted = _VAL_COUNTER.value == 0
+        if train_exhausted and val_exhausted:
+            return []
     try:
         return _process_sample(sample_dir)
     except Exception:  # noqa: BLE001
@@ -302,7 +314,7 @@ def _worker_process(sample_dir: Path) -> List[Dict[str, Any]]:
 def _process_sample(
     sample_dir: Path,
     state: Optional[Dict[str, Any]] = None,
-    claim_split: Optional[Callable[[], Optional[str]]] = None,
+    claim_split: Optional[Callable[[str], Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     active_state = state or _WORKER_STATE
     if active_state is None:
@@ -344,7 +356,7 @@ def _process_sample(
         return []
 
     splitter = claim_split or _claim_split_mp
-    split = splitter()
+    split = splitter(sample_dir.name)
     if split is None:
         logging.debug("Capacity reached; skipping sample %s", sample_dir.name)
         return []
@@ -533,6 +545,21 @@ def write_manifest(records: List[Dict[str, Any]], manifest_path: Path) -> None:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+def load_validation_set(path: Optional[Path]) -> Set[str]:
+    """
+    Load validation sample names (one per line). Blank lines are ignored.
+    """
+    if path is None:
+        return set()
+    if not path.exists():
+        logging.info("Validation list %s not found; all samples will default to train.", path)
+        return set()
+    with path.open("r", encoding="utf-8") as f:
+        names = {line.strip() for line in f if line.strip()}
+    logging.info("Loaded %d validation sample names from %s", len(names), path)
+    return names
+
+
 def _flatten_structure(records: List[Dict[str, Any]], output_root: Path) -> None:
     """
     Ensure component/composite files live directly under bucket directories and
@@ -609,8 +636,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bucket RGBA component layers for VAE training.")
     parser.add_argument("--rendered-root", type=Path, default=DEFAULT_RENDERED_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--train-count", type=int, default=1000, help="Target number of training composites (one composite per sample).")
-    parser.add_argument("--val-count", type=int, default=50, help="Target number of validation composites (one composite per sample).")
+    parser.add_argument(
+        "--validation-list",
+        type=Path,
+        default=DEFAULT_VALIDATION_LIST,
+        help="File containing sample names for validation split (one per line). If missing or empty, all go to train unless counts force otherwise.",
+    )
+    parser.add_argument(
+        "--train-count",
+        type=int,
+        default=None,
+        help="Optional cap on number of training composites. Omit for unlimited.",
+    )
+    parser.add_argument(
+        "--val-count",
+        type=int,
+        default=None,
+        help="Optional cap on number of validation composites. Omit for unlimited.",
+    )
     parser.add_argument("--fg-max-groups", type=int, default=None, help="Optional cap on the number of foreground groups to emit per sample.")
     parser.add_argument("--fg-erosion-iterations", type=int, default=1, help="3x3 erosion iterations before overlap grouping (default: 1).")
     parser.add_argument("--num-workers", type=int, default=1, help="Number of worker processes to use for sample generation.")
@@ -622,6 +665,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    validation_set = load_validation_set(args.validation_list)
+    train_limit = args.train_count if args.train_count is not None else -1
+    val_limit = args.val_count if args.val_count is not None else -1
 
     sample_dirs = sorted(d for d in args.rendered_root.iterdir() if d.is_dir())
     if args.max_samples is not None:
@@ -640,32 +687,45 @@ def main() -> None:
         "fg_max_groups": args.fg_max_groups,
         "fg_erosion_iterations": args.fg_erosion_iterations,
         "seed": args.seed,
+        "validation_set": validation_set,
     }
 
     manifest_records: List[Dict[str, Any]] = []
 
     if args.num_workers <= 1:
-        train_remaining = args.train_count
-        val_remaining = args.val_count
+        train_remaining: Optional[int] = None if train_limit < 0 else train_limit
+        val_remaining: Optional[int] = None if val_limit < 0 else val_limit
 
-        def claim_split_local() -> Optional[str]:
+        def claim_split_local(sample_name: str) -> Optional[str]:
             nonlocal train_remaining, val_remaining
+            wants_val = sample_name in validation_set
+            if wants_val:
+                if val_remaining is None:
+                    return "val"
+                if val_remaining > 0:
+                    val_remaining -= 1
+                    return "val"
+                return None
+            if train_remaining is None:
+                return "train"
             if train_remaining > 0:
                 train_remaining -= 1
                 return "train"
-            if val_remaining > 0:
-                val_remaining -= 1
-                return "val"
             return None
 
+        def limits_exhausted() -> bool:
+            return (train_remaining is not None and train_remaining <= 0) and (
+                val_remaining is not None and val_remaining <= 0
+            )
+
         for sample_dir in tqdm(shuffled_dirs, desc="Processing samples"):
-            if train_remaining <= 0 and val_remaining <= 0:
+            if limits_exhausted():
                 break
             entries = _process_sample(sample_dir, state, claim_split_local)
             manifest_records.extend(entries)
     else:
-        train_counter = mp.Value("i", args.train_count)
-        val_counter = mp.Value("i", args.val_count)
+        train_counter = mp.Value("i", train_limit)
+        val_counter = mp.Value("i", val_limit)
         lock = mp.Lock()
         pool = mp.Pool(
             processes=args.num_workers,
@@ -677,7 +737,9 @@ def main() -> None:
             iterator = pool.imap_unordered(_worker_process, shuffled_dirs)
             for entries in tqdm(iterator, total=len(shuffled_dirs), desc="Processing samples"):
                 manifest_records.extend(entries)
-                if train_counter.value <= 0 and val_counter.value <= 0:
+                train_exhausted = train_counter.value == 0
+                val_exhausted = val_counter.value == 0
+                if train_exhausted and val_exhausted:
                     pool.terminate()
                     terminated = True
                     break
@@ -688,7 +750,12 @@ def main() -> None:
         train_remaining = train_counter.value
         val_remaining = val_counter.value
 
-    if train_remaining > 0 or val_remaining > 0:
+    def is_unlimited(value: Optional[int]) -> bool:
+        return value is None or value == -1
+
+    if (not is_unlimited(train_remaining) and train_remaining > 0) or (
+        not is_unlimited(val_remaining) and val_remaining > 0
+    ):
         logging.warning(
             "Did not reach requested counts (train_remaining=%d, val_remaining=%d)",
             train_remaining,
