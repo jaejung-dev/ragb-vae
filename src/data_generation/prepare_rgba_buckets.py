@@ -11,6 +11,7 @@ Counts are based on number of components (train/train_count, val/val_count).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ MULTIPLE = 32
 MIN_BUCKET_SIDE = MULTIPLE
 FILTER_MIN_SIDE = 256
 FILTER_MAX_AR = 2.3
+BACKGROUND_VISIBILITY_THRESHOLD = 0.01
 
 
 _WORKER_STATE: Dict[str, Any] | None = None
@@ -174,6 +176,22 @@ def _erode_masks(masks: Dict[int, np.ndarray], iterations: int) -> Dict[int, np.
     return eroded
 
 
+def _background_visible_ratio(masks: Dict[int, np.ndarray]) -> float:
+    """
+    Estimate how much of the background remains visible (not covered by components).
+    """
+    if not masks:
+        return 1.0
+    union = np.zeros_like(next(iter(masks.values())), dtype=bool)
+    for mask in masks.values():
+        union |= mask
+    total = union.size
+    if total <= 0:
+        return 1.0
+    visible = total - int(union.sum())
+    return float(visible) / float(total)
+
+
 def _find_unoverlapped_indices(remaining: Sequence[int], eroded_masks: Dict[int, np.ndarray]) -> List[int]:
     if not remaining:
         return []
@@ -204,8 +222,9 @@ def iterate_foreground_groups(
     *,
     erosion_iterations: int,
     max_groups: Optional[int],
+    masks: Optional[Dict[int, np.ndarray]] = None,
 ):
-    masks = _build_component_masks(components)
+    masks = masks if masks is not None else _build_component_masks(components)
     if not masks:
         return
     eroded_masks = _erode_masks(masks, iterations=erosion_iterations)
@@ -245,6 +264,26 @@ def _init_worker(state: Dict[str, Any], train_counter, val_counter, lock) -> Non
     _COUNTER_LOCK = lock
 
 
+def _make_sample_rng(sample_name: str, base_seed: int) -> np.random.Generator:
+    digest = hashlib.sha256(f"{sample_name}|{base_seed}".encode("utf-8")).digest()
+    seed = int.from_bytes(digest[:8], byteorder="little", signed=False)
+    return np.random.default_rng(seed)
+
+
+def _pick_component_by_alpha(
+    indices: Sequence[int],
+    alpha_sums: Dict[int, int],
+    rng: np.random.Generator,
+) -> Optional[int]:
+    if not indices:
+        return None
+    weights = np.array([alpha_sums.get(idx, 0) for idx in indices], dtype=np.float64)
+    probs = None
+    if np.any(weights):
+        probs = weights / weights.sum()
+    return int(rng.choice(indices, p=probs))
+
+
 def _worker_process(sample_dir: Path) -> List[Dict[str, Any]]:
     if (
         _TRAIN_COUNTER is not None
@@ -276,6 +315,12 @@ def _process_sample(
     with Image.open(resolve_background_path(sample_dir)) as bg:
         background = bg.convert("RGBA")
     component_images = [load_rgba(path) for path in component_paths]
+    component_masks = _build_component_masks(component_images)
+    if not component_masks:
+        return []
+    component_alpha_sums = {idx: int(mask.sum()) for idx, mask in component_masks.items()}
+    visible_ratio = _background_visible_ratio(component_masks)
+    background_visible = visible_ratio > BACKGROUND_VISIBILITY_THRESHOLD
 
     assignment, reason = bucket_assignment(background.size)
     if assignment is None:
@@ -284,11 +329,14 @@ def _process_sample(
     bucket_name, bucket_dims = assignment
 
     groups: List[Tuple[int, List[int], Image.Image, Image.Image]] = []
+    rng = _make_sample_rng(sample_dir.name, int(active_state.get("seed", 0)))
+
     for stage_idx, picks, base_image, fg_image in iterate_foreground_groups(
         background,
         component_images,
         erosion_iterations=active_state["fg_erosion_iterations"],
         max_groups=active_state["fg_max_groups"],
+        masks=component_masks,
     ):
         groups.append((stage_idx, list(picks), base_image, fg_image))
 
@@ -307,11 +355,68 @@ def _process_sample(
         logging.debug("Sample %s already processed for %s; skipping", sample_dir.name, split)
         return []
 
+    background_rel: Optional[Path] = None
+    if background_visible:
+        background_rel = save_background(
+            background,
+            split=split,
+            sample_name=sample_dir.name,
+            bucket_name=bucket_name,
+            bucket_dims=bucket_dims,
+            output_root=output_root,
+        )
+    else:
+        logging.debug(
+            "Skipping background save for %s (visible_ratio=%.4f <= %.3f)",
+            sample_dir.name,
+            visible_ratio,
+            BACKGROUND_VISIBILITY_THRESHOLD,
+        )
+
     entries: List[Dict[str, Any]] = []
     composite_rel: Optional[str] = None
     composite_stage: Optional[int] = None
+    last_stage = groups[-1][0]
 
     for stage_idx, group_indices, base_image, fg_image in groups:
+        do_select = stage_idx != last_stage
+        selected_indices: List[int] = []
+        selected_paths: List[Path] = []
+        if do_select and group_indices:
+            first_idx = _pick_component_by_alpha(group_indices, component_alpha_sums, rng)
+            if first_idx is not None:
+                selected_indices.append(first_idx)
+                selected_paths.append(
+                    save_selected_component(
+                        component_images[first_idx],
+                        split=split,
+                        sample_name=sample_dir.name,
+                        comp_idx=stage_idx,
+                        bucket_name=bucket_name,
+                        bucket_dims=bucket_dims,
+                        output_root=output_root,
+                        selection_rank=0,
+                    )
+                )
+                remaining = [idx for idx in group_indices if idx != first_idx]
+                if remaining:
+                    second_idx = _pick_component_by_alpha(
+                        remaining, component_alpha_sums, rng
+                    )
+                    if second_idx is not None:
+                        selected_indices.append(second_idx)
+                        selected_paths.append(
+                            save_selected_component(
+                                component_images[second_idx],
+                                split=split,
+                                sample_name=sample_dir.name,
+                                comp_idx=stage_idx,
+                                bucket_name=bucket_name,
+                                bucket_dims=bucket_dims,
+                                output_root=output_root,
+                                selection_rank=1,
+                            )
+                        )
         comp_rel = save_component(
             fg_image,
             split=split,
@@ -340,12 +445,21 @@ def _process_sample(
                 "bucket_dims": list(bucket_dims),
                 "component_path": str(comp_rel),
                 "composite_path": str(composite_rel),
+                "background_path": str(background_rel) if background_rel else None,
                 "source_sample": sample_dir.name,
                 "component_index": stage_idx,
                 "composite_stage": composite_stage,
                 "group_size": len(group_indices),
                 "group_indices": group_indices,
                 "original_size": fg_size,
+                "selected_component_index": selected_indices[0]
+                if selected_indices
+                else None,
+                "selected_component_path": str(selected_paths[0])
+                if selected_paths
+                else None,
+                "selected_component_indices": selected_indices,
+                "selected_component_paths": [str(p) for p in selected_paths],
             }
         )
         base_image.close()
@@ -371,6 +485,45 @@ def save_composite(
     bucket_root.mkdir(parents=True, exist_ok=True)
     out_path = bucket_root / f"{sample_name}_fg{comp_idx:03d}_composite.png"
     composite.resize(bucket_dims, resample=Image.LANCZOS).save(out_path)
+    return out_path.relative_to(output_root)
+
+
+def save_background(
+    background: Image.Image,
+    split: str,
+    sample_name: str,
+    bucket_name: str,
+    bucket_dims: Tuple[int, int],
+    output_root: Path,
+) -> Path:
+    """
+    Save the resized background once per sample to align with bucket dimensions.
+    """
+    bucket_root = output_root / split / bucket_name
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    out_path = bucket_root / f"{sample_name}_background.png"
+    background.resize(bucket_dims, resample=Image.LANCZOS).save(out_path)
+    return out_path.relative_to(output_root)
+
+
+def save_selected_component(
+    img: Image.Image,
+    split: str,
+    sample_name: str,
+    comp_idx: int,
+    bucket_name: str,
+    bucket_dims: Tuple[int, int],
+    output_root: Path,
+    selection_rank: int = 0,
+) -> Path:
+    bucket_root = output_root / split / bucket_name
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    suffix = (
+        "selected.png" if selection_rank == 0 else f"selected{selection_rank}.png"
+    )
+    filename = f"{sample_name}_fg{comp_idx:03d}_{suffix}"
+    out_path = bucket_root / filename
+    img.resize(bucket_dims, resample=Image.LANCZOS).save(out_path)
     return out_path.relative_to(output_root)
 
 
@@ -421,6 +574,22 @@ def _flatten_structure(records: List[Dict[str, Any]], output_root: Path) -> None
                 break
         entry["composite_path"] = str(Path(split) / bucket / composite_name)
 
+        background_rel = entry.get("background_path")
+        if background_rel:
+            bg_name = Path(background_rel).name
+            bg_dst = bucket_root / bg_name
+            bg_candidates = [
+                output_root / background_rel,
+                bucket_root / "background" / bg_name,
+            ]
+            for src in bg_candidates:
+                if src.exists():
+                    if src != bg_dst:
+                        bg_dst.parent.mkdir(parents=True, exist_ok=True)
+                        src.replace(bg_dst)
+                    break
+            entry["background_path"] = str(Path(split) / bucket / bg_name)
+
     # Remove empty legacy directories
     for split_dir in (output_root / "train", output_root / "val"):
         if not split_dir.exists():
@@ -470,6 +639,7 @@ def main() -> None:
         "output_root": str(output_root),
         "fg_max_groups": args.fg_max_groups,
         "fg_erosion_iterations": args.fg_erosion_iterations,
+        "seed": args.seed,
     }
 
     manifest_records: List[Dict[str, Any]] = []
@@ -533,4 +703,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
