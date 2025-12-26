@@ -26,6 +26,7 @@ from typing import Dict, Optional, Tuple
 import requests
 from datasets import load_dataset
 from PIL import Image
+from tqdm import tqdm
 
 # Bucket rules (aligned with prepare_rgba_buckets.py)
 MAX_SIDE = 1408
@@ -134,7 +135,9 @@ def main():
     manifest = []
     futures = []
     kept = 0
-    with ThreadPoolExecutor(max_workers=args.num_workers) as ex:
+    with ThreadPoolExecutor(max_workers=args.num_workers) as ex, tqdm(
+        total=args.max_samples, unit="img", desc="kept"
+    ) as pbar:
         for row in ds:
             if kept >= args.max_samples:
                 break
@@ -152,6 +155,7 @@ def main():
                     if res:
                         manifest.append(res)
                         kept += 1
+                        pbar.update(1)
                         if kept >= args.max_samples:
                             break
                 futures = []
@@ -164,6 +168,7 @@ def main():
             if res:
                 manifest.append(res)
                 kept += 1
+                pbar.update(1)
                 if kept >= args.max_samples:
                     break
 
