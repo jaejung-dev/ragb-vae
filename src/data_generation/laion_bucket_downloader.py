@@ -2,13 +2,13 @@
 """
 Download a subset of laion/laion2B-en-aesthetic, filter by min side,
 bucket-resize (same rules as prepare_rgba_buckets), and save RGB images
-into bucketed folders with a manifest.
+as PNG into bucketed folders with a manifest.
 
 Notes:
 - Dataset is gated; you must have accepted access at HF.
 - Uses streaming iteration to avoid full download.
 - Skips samples with min(width, height) < --min-side (default 512).
-- Saves JPEG by default to reduce size.
+- Saves PNG (lossless).
 """
 
 from __future__ import annotations
@@ -79,7 +79,6 @@ def process_row(
     row: Dict,
     output_root: Path,
     min_side: int,
-    jpeg_quality: int,
 ) -> Optional[Dict]:
     url = row.get("URL") or row.get("url")
     if not url:
@@ -95,8 +94,8 @@ def process_row(
     bucket_dir.mkdir(parents=True, exist_ok=True)
 
     img_id = safe_image_id(url)
-    out_path = bucket_dir / f"{img_id}.jpg"
-    img.resize(bucket_dims, resample=Image.LANCZOS).save(out_path, "JPEG", quality=jpeg_quality)
+    out_path = bucket_dir / f"{img_id}.png"
+    img.resize(bucket_dims, resample=Image.LANCZOS).save(out_path, "PNG")
 
     return {
         "url": url,
@@ -114,7 +113,6 @@ def main():
     parser.add_argument("--max-samples", type=int, default=1_000_000, help="Max number of kept images.")
     parser.add_argument("--min-side", type=int, default=DEFAULT_MIN_SIDE, help="Skip images smaller than this.")
     parser.add_argument("--num-workers", type=int, default=16, help="Download/resize thread pool size.")
-    parser.add_argument("--jpeg-quality", type=int, default=92, help="JPEG save quality.")
     parser.add_argument("--hf-cache", type=Path, default=None, help="Optional HF cache dir (sets HF_HOME/HF_DATASETS_CACHE).")
     args = parser.parse_args()
 
@@ -140,7 +138,6 @@ def main():
                 row,
                 output_root,
                 args.min_side,
-                args.jpeg_quality,
             )
             futures.append(fut)
             # throttle queue to avoid unbounded memory
