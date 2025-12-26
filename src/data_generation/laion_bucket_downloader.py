@@ -30,9 +30,10 @@ from PIL import Image
 # Bucket rules (aligned with prepare_rgba_buckets.py)
 MAX_SIDE = 1408
 MAX_PIXELS = 1408 * 768
-MULTIPLE = 32
+MULTIPLE = 64
 MIN_BUCKET_SIDE = MULTIPLE
 DEFAULT_MIN_SIDE = 512  # user requirement: skip < 512
+FILTER_MAX_AR = 2.0  # same as prepare_rgba_buckets.py
 
 
 def round_to_multiple(value: float, multiple: int = MULTIPLE) -> int:
@@ -55,6 +56,10 @@ def bucket_assignment(size: Tuple[int, int], min_side: int = DEFAULT_MIN_SIDE):
         return None, "invalid_dimensions"
     if min(w, h) < min_side:
         return None, f"too_small(<{min_side})"
+    larger = max(w, h)
+    smaller = min(w, h)
+    if smaller <= 0 or larger / smaller >= FILTER_MAX_AR:
+        return None, f"extreme_aspect_ratio(>={FILTER_MAX_AR})"
     # Use the same aspect/scale logic as prepare_rgba_buckets, but rely on MAX_SIDE/MAX_PIXELS
     bucket_dims = bucket_for_size(w, h)
     bucket_key = f"w{bucket_dims[0]}-h{bucket_dims[1]}"
