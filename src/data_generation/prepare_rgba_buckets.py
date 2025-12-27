@@ -32,9 +32,9 @@ DEFAULT_VALIDATION_LIST = Path("/home/ubuntu/ragb-vae/validation_list.txt")
 # Lower bounds to keep each resized sample <=1.1M pixels (lighter batches).
 MAX_SIDE = 1408
 MAX_PIXELS = 1408 * 768
-MULTIPLE = 32
+MULTIPLE = 64
 MIN_BUCKET_SIDE = MULTIPLE
-FILTER_MIN_SIDE = 256
+FILTER_MIN_SIDE = 384
 FILTER_MAX_AR = 2.3
 BACKGROUND_VISIBILITY_THRESHOLD = 0.01
 

@@ -44,7 +44,9 @@ def main() -> None:
     torch_dtype = dtype_map[args.dtype]
 
     default_subfolder = "ae" if args.arch == "flux" else "vae"
-    subfolder = args.subfolder or default_subfolder
+    # Allow empty string to mean "no subfolder" (use None)
+    subfolder = args.subfolder if args.subfolder != "" else None
+    subfolder = subfolder or default_subfolder
 
     if args.arch == "flux":
         vae = convert_flux(

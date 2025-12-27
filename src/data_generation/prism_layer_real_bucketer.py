@@ -30,9 +30,9 @@ from PIL import Image
 # Bucket rules (aligned with prepare_rgba_buckets defaults)
 MAX_SIDE = 1408
 MAX_PIXELS = 1408 * 768
-MULTIPLE = 32
+MULTIPLE = 64
 MIN_BUCKET_SIDE = MULTIPLE
-FILTER_MIN_SIDE = 256
+FILTER_MIN_SIDE = 384
 FILTER_MAX_AR = 2.3
 
 
@@ -61,7 +61,7 @@ def layer_to_full_canvas(layer_val, box, canvas_size):
         return None
     expected_size = (x1 - x0, y1 - y0)
     if layer_img.size != expected_size:
-        print(f"Warning: layer size {layer_img.size} != box size {expected_size}")
+        layer_img = layer_img.resize(expected_size, Image.LANCZOS)
     canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     canvas.paste(layer_img, (x0, y0), layer_img)
     return canvas
