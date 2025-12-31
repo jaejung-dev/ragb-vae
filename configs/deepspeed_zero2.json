@@ -1,5 +1,5 @@
 {
-  "train_micro_batch_size_per_gpu": "auto",
+  "train_micro_batch_size_per_gpu": 4,
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {
@@ -11,8 +11,8 @@
     "overlap_comm": true,
     "contiguous_gradients": true,
     "reduce_scatter": true,
-    "reduce_bucket_size": 500000000,
-    "allgather_bucket_size": 500000000
+    "reduce_bucket_size": 200000000,
+    "allgather_bucket_size": 200000000
   },
   "bf16": {
     "enabled": true

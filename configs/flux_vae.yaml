@@ -1,32 +1,36 @@
 data:
   source: bucket
-  bucket_root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset
+  bucket_root: /mnt/data/for_jjseol/rgba_dataset
   bucket_split: train
   bucket_val_split: val
   bucket_datasets:
     - type: components
-      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/lica_250k
-      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/lica_250k/metadata/manifest.json
+      root: /mnt/data/for_jjseol/rgba_dataset/lica_250k
+      manifest: /mnt/data/for_jjseol/rgba_dataset/lica_250k/metadata/manifest.json
     - type: prism_real
-      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_real
-      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_real/metadata/manifest.json
+      root: /mnt/data/for_jjseol/rgba_dataset/prism_layer_real
+      manifest: /mnt/data/for_jjseol/rgba_dataset/prism_layer_real/metadata/manifest.json
       split: train
       splits: [train]
     - type: prism_pro
-      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_pro
-      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_pro/metadata/manifest.json
+      root: /mnt/data/for_jjseol/rgba_dataset/prism_layer_pro
+      manifest: /mnt/data/for_jjseol/rgba_dataset/prism_layer_pro/metadata/manifest.json
       split: train
       splits: [train]
       respect_manifest_split: false
       use_fg_non_overlap: true
       use_rep: true
     - type: laion_rgb
-      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/laion1M_aethtetic
+      root: /mnt/data/for_jjseol/rgba_dataset/laion1M_aethtetic
       split: train
       splits: [train]
-  batch_size: 2
-  num_workers: 16
+  batch_size: 4
+  num_workers: 32
   shuffle: true
+  interleave_buckets: true
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
   background_blend_prob: 0.1
   background_blend_targets:
     - composite
@@ -44,14 +48,14 @@ training:
   mixed_precision: "bf16"
   log_every: 50
   run_validation: true
-  val_every_steps: 200
-  val_max_batches: 100
+  val_every_steps: 1000
+  val_max_batches: 200
   val_visual_rows: 16
   val_output_dir: outputs/val_flux
   val_background_colors:
     - white
     - black
-  ckpt_every_steps: 2000
+  ckpt_every_steps: 10000
   max_grad_norm: 1.0
   vae_slicing: true
   vae_gradient_checkpointing: true
@@ -61,6 +65,8 @@ training:
   loss_reduce_mean: true
   use_naive_mse: false
   deepspeed_config: configs/deepspeed_zero2.json
+  sample_vis_count: 32      # 저장할 개수
+  sample_vis_dir: outputs/sample_vis
 
 model:
   name: rgba_vae
@@ -71,7 +77,7 @@ model:
   rgb_loss_weight: 1.0
   white_bg_loss_weight: 0.5
   black_bg_loss_weight: 0.5
-  rgb_checkpoint: /home/ubuntu/qwen-image-layered/checkpoints/flux_rgba_vae_init
+  rgb_checkpoint: /home/ubuntu/ragb-vae/checkpoints/flux_rgba_vae_init
   rgb_subfolder: ""
   ref_rgb_checkpoint: null
   ref_rgb_subfolder: null

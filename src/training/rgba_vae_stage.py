@@ -14,6 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
 from src.data.multilayer_dataset import MultiLayerDataset, multilayer_collate
@@ -43,6 +44,44 @@ def _ensure_finite(value: torch.Tensor, name: str, *, epoch: int, step: int, acc
         raise RuntimeError(f"Non-finite tensor encountered in '{name}'")
 
 
+def _count_trainable_params(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _log_batch_and_buckets(
+    *,
+    accelerator: Accelerator,
+    batch_size: int,
+    grad_accum: int,
+    ds_config: Optional[Dict[str, Any]],
+    train_loader: DataLoader,
+) -> None:
+    world = accelerator.num_processes
+    eff_batch = batch_size * grad_accum * world
+    ds_micro = None
+    if ds_config:
+        ds_micro = ds_config.get("train_micro_batch_size_per_gpu")
+
+    accelerator.print(
+        "[Batch] per_device=%s grad_accum=%s world=%s -> effective=%s (per step)"
+        % (batch_size, grad_accum, world, eff_batch)
+    )
+    if ds_micro is not None:
+        accelerator.print(f"[Batch] deepspeed train_micro_batch_size_per_gpu={ds_micro}")
+
+    ds_obj = getattr(train_loader, "dataset", None)
+    if ds_obj is not None and hasattr(ds_obj, "bucket_to_indices"):
+        bucket_map = getattr(ds_obj, "bucket_to_indices")
+        total = sum(len(v) for v in bucket_map.values())
+        accelerator.print(
+            f"[Buckets] count={len(bucket_map)} total_samples={total}"
+        )
+        # show top-5 largest buckets
+        top = sorted(bucket_map.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
+        for name, idxs in top:
+            accelerator.print(f"[Buckets] {name}: {len(idxs)} samples ({len(idxs)/total:.2%})")
+
+
 class RandomBackgroundBlend:
     """
     Blend RGBA tensors onto a random opaque background with a small probability.
@@ -64,6 +103,10 @@ class RandomBackgroundBlend:
 
     def __call__(self, sample: TensorDict) -> TensorDict:
         if random.random() >= self.prob:
+            # Ensure downstream collation sees a consistent key even when no augmentation happens
+            if "background_augmented" not in sample:
+                sample = dict(sample)
+                sample["background_augmented"] = False
             return sample
         augmented = dict(sample)
         for key in self.keys:
@@ -93,6 +136,9 @@ def build_dataloader(cfg: Dict[str, Any], *, split: Optional[str] = None) -> Dat
     target_split = split or "train"
     train_mode = target_split == "train"
     val_shuffle = bool(data_cfg.get("val_shuffle", False))
+    pin_memory = bool(data_cfg.get("pin_memory", True))
+    persistent_workers = bool(data_cfg.get("persistent_workers", False))
+    prefetch_factor = data_cfg.get("prefetch_factor")
 
     if source == "bucket":
         dataset_kwargs = data_cfg.get("dataset_kwargs", {"include_metadata": False})
@@ -160,13 +206,16 @@ def build_dataloader(cfg: Dict[str, Any], *, split: Optional[str] = None) -> Dat
             batch_size=data_cfg.get("batch_size", 4),
             shuffle=shuffle,
             drop_last=bool(data_cfg.get("drop_last", False)),
+            interleave=bool(data_cfg.get("interleave_buckets", False)),
         )
 
         return DataLoader(
             dataset,
             batch_sampler=batch_sampler,
             num_workers=data_cfg.get("num_workers", 4),
-            pin_memory=True,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
             collate_fn=None,
         )
 
@@ -182,8 +231,10 @@ def build_dataloader(cfg: Dict[str, Any], *, split: Optional[str] = None) -> Dat
         batch_size=data_cfg.get("batch_size", 1),
         shuffle=should_shuffle,
         num_workers=data_cfg.get("num_workers", 4),
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         collate_fn=multilayer_collate,
-        pin_memory=True,
     )
     return dl
 
@@ -198,6 +249,7 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
         mixed_precision = "fp16" if mixed_precision else "no"
 
     deepspeed_plugin: Optional[DeepSpeedPlugin] = None
+    ds_config: Optional[Dict[str, Any]] = None
     ds_config_path = train_cfg.get("deepspeed_config")
     if ds_config_path:
         resolved_path = Path(ds_config_path)
@@ -269,7 +321,15 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
 
     lr = float(train_cfg.get("learning_rate", 1e-4))
     epochs = train_cfg.get("epochs", 1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,  betas=(0.5, 0.9))
+    use_fused = bool(train_cfg.get("use_fused_adamw", True))
+    optimizer = None
+    if use_fused:
+        try:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.5, 0.9), fused=True)
+        except TypeError:
+            optimizer = None
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.5, 0.9))
 
     loss_module = AlphaVaeLoss(
         reduce_mean=train_cfg.get("loss_reduce_mean", False),
@@ -278,6 +338,20 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
         custom_eb=model_cfg.get("loss_eb"),
         custom_eb2=model_cfg.get("loss_eb2"),
     )
+
+    sample_vis_count = int(train_cfg.get("sample_vis_count", 150) or 0)
+    sample_vis_dir = train_cfg.get("sample_vis_dir", "outputs/sample_vis")
+    sample_vis_nrow = int(train_cfg.get("sample_vis_nrow", 10) or 10)
+    if sample_vis_count > 0:
+        try:
+            visualize_dataloader_samples(
+                train_loader,
+                limit=sample_vis_count,
+                output_dir=sample_vis_dir,
+                nrow=sample_vis_nrow,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort preview
+            print(f"[RGBA-VAE] dataloader preview failed: {exc}")
 
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     try:
@@ -331,6 +405,21 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
         ref_vae_dtype = next(ref_vae.parameters()).dtype
         for param in ref_vae.parameters():
             param.requires_grad_(False)
+
+    # Log batch / bucket info once after prepare
+    _log_batch_and_buckets(
+        accelerator=accelerator,
+        batch_size=int(data_cfg.get("batch_size", 1)),
+        grad_accum=int(train_cfg.get("gradient_accumulation_steps", 1)),
+        ds_config=ds_config,
+        train_loader=train_loader,
+    )
+    # Log trainable parameter count
+    try:
+        trainable_params = _count_trainable_params(accelerator.unwrap_model(model))
+        accelerator.print(f"[Params] trainable parameters: {trainable_params:,}")
+    except Exception:
+        pass
 
     for epoch in range(epochs):
         progress_bar = tqdm(
@@ -535,6 +624,68 @@ def build_detail_augmented_triplet(target: torch.Tensor) -> torch.Tensor:
     white[:, 3:] = 1.0
 
     return torch.cat([target, black, white], dim=0)
+
+
+@torch.no_grad()
+def visualize_dataloader_samples(
+    dataloader: DataLoader,
+    *,
+    limit: int = 150,
+    output_dir: str = "outputs/sample_vis",
+    nrow: int = 10,
+) -> None:
+    """
+    Quickly dump a grid of RGBA samples composited on a checkerboard background
+    to verify data quality.
+    """
+    target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    samples: List[torch.Tensor] = []
+    for batch in dataloader:
+        tensor = batch.get("composite")
+        if tensor is None:
+            tensor = batch.get("component")
+        if tensor is None:
+            continue
+        if tensor.dim() == 3:  # single sample
+            tensor = tensor.unsqueeze(0)
+        for item in tensor:
+            samples.append(item.cpu())
+            if len(samples) >= limit:
+                break
+        if len(samples) >= limit:
+            break
+
+    if not samples:
+        print("[RGBA-VAE] dataloader preview skipped (no samples collected)")
+        return
+
+    batch_tensor = torch.stack(samples)
+    rgb = batch_tensor[:, :3]
+    alpha = batch_tensor[:, 3:4]
+
+    # Normalize to [0, 1] if input is in [-1, 1]
+    if (rgb.min() < -0.01) or (rgb.max() > 1.01) or (alpha.min() < -0.01) or (alpha.max() > 1.01):
+        rgb = (rgb + 1.0) * 0.5
+        alpha = (alpha + 1.0) * 0.5
+
+    rgb = rgb.clamp(0.0, 1.0)
+    alpha = alpha.clamp(0.0, 1.0)
+
+    _, _, h, w = rgb.shape
+    tile = 16
+    y = torch.arange(h).view(-1, 1)
+    x = torch.arange(w).view(1, -1)
+    pattern = ((y // tile + x // tile) % 2).to(dtype=rgb.dtype)
+    pattern = pattern * 0.9 + 0.1  # light/dark squares
+    checker = pattern.unsqueeze(0).repeat(3, 1, 1)  # (3, H, W)
+    checker = checker.unsqueeze(0).repeat(rgb.shape[0], 1, 1, 1)  # (N, 3, H, W)
+
+    composed = rgb * alpha + checker * (1.0 - alpha)
+    for idx, img in enumerate(composed):
+        save_image(img, target_dir / f"sample_{idx:04d}.png")
+    print(f"[RGBA-VAE] saved checkerboard previews to {target_dir} ({len(composed)} files)")
 
 
 def split_triplet_distribution(

@@ -304,27 +304,62 @@ class BucketBatchSampler:
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = False,
+        interleave: bool = False,
     ) -> None:
         self.bucket_to_indices = {k: list(v) for k, v in bucket_to_indices.items()}
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.interleave = interleave
 
     def __iter__(self):
-        bucket_keys = list(self.bucket_to_indices.keys())
-        if self.shuffle:
-            random.shuffle(bucket_keys)
-        for bucket in bucket_keys:
-            indices = list(self.bucket_to_indices[bucket])
+        if not self.interleave:
+            bucket_keys = list(self.bucket_to_indices.keys())
             if self.shuffle:
-                random.shuffle(indices)
-            total = len(indices)
-            step = self.batch_size
-            max_len = total - (total % step) if self.drop_last else total
-            for start in range(0, max_len, step):
-                batch = indices[start : start + step]
-                if len(batch) < self.batch_size and self.drop_last:
+                random.shuffle(bucket_keys)
+            for bucket in bucket_keys:
+                indices = list(self.bucket_to_indices[bucket])
+                if self.shuffle:
+                    random.shuffle(indices)
+                total = len(indices)
+                step = self.batch_size
+                max_len = total - (total % step) if self.drop_last else total
+                for start in range(0, max_len, step):
+                    batch = indices[start : start + step]
+                    if len(batch) < self.batch_size and self.drop_last:
+                        continue
+                    yield batch
+            return
+
+        # Interleaved path: pick buckets repeatedly (proportional to remaining size when shuffled)
+        bucket_to_indices = {k: list(v) for k, v in self.bucket_to_indices.items()}
+        for k, v in bucket_to_indices.items():
+            if self.shuffle:
+                random.shuffle(v)
+
+        active = [k for k, v in bucket_to_indices.items() if v]
+        while active:
+            if self.shuffle and len(active) > 1:
+                weights = [len(bucket_to_indices[k]) for k in active]
+                bucket = random.choices(active, weights=weights, k=1)[0]
+            else:
+                bucket = active[0]
+
+            indices = bucket_to_indices[bucket]
+            if len(indices) < self.batch_size:
+                if self.drop_last:
+                    active.remove(bucket)
                     continue
+                batch = indices[:]
+                bucket_to_indices[bucket] = []
+            else:
+                batch = indices[: self.batch_size]
+                bucket_to_indices[bucket] = indices[self.batch_size :]
+
+            if not bucket_to_indices[bucket]:
+                active.remove(bucket)
+
+            if batch:
                 yield batch
 
     def __len__(self) -> int:
