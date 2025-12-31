@@ -18,6 +18,11 @@ from tqdm.auto import tqdm
 
 from src.data.multilayer_dataset import MultiLayerDataset, multilayer_collate
 from src.data_generation import create_component_dataloader
+from src.data_generation.bucket_dataset import (
+    BucketBatchSampler,
+    MixedBucketDataset,
+    build_bucket_entries,
+)
 from src.models import AlphaVaeLoss, RgbaVAE
 from src.models.rgba_vae import (
     composite_over_background,
@@ -93,6 +98,8 @@ def build_dataloader(cfg: Dict[str, Any], *, split: Optional[str] = None) -> Dat
         dataset_kwargs = data_cfg.get("dataset_kwargs", {"include_metadata": False})
         val_dataset_kwargs = data_cfg.get("val_dataset_kwargs", dataset_kwargs)
 
+        use_mixed = bool(data_cfg.get("bucket_datasets"))
+
         if target_split == "val":
             split_name = data_cfg.get("bucket_val_split", "val")
             shuffle = val_shuffle
@@ -110,16 +117,57 @@ def build_dataloader(cfg: Dict[str, Any], *, split: Optional[str] = None) -> Dat
                 color_range = tuple(data_cfg.get("background_color_range", [0.2, 0.9]))
                 transform = RandomBackgroundBlend(prob=blend_prob, keys=targets, color_range=color_range)  # type: ignore[arg-type]
 
-        return create_component_dataloader(
-            root_dir=data_cfg.get("bucket_root", "data/rgba_layers"),
-            manifest_path=data_cfg.get("bucket_manifest"),
+        if not use_mixed:
+            return create_component_dataloader(
+                root_dir=data_cfg.get("bucket_root", "data/rgba_layers"),
+                manifest_path=data_cfg.get("bucket_manifest"),
+                split=split_name,
+                batch_size=data_cfg.get("batch_size", 4),
+                shuffle=shuffle,
+                num_workers=data_cfg.get("num_workers", 4),
+                limit=data_cfg.get("limit"),
+                transform=transform,
+                dataset_kwargs=extra_kwargs,
+            )
+
+        # Mixed dataset path: build entries from multiple manifests/sources
+        bucket_entries = build_bucket_entries(
+            data_cfg.get("bucket_datasets", []),
             split=split_name,
+        )
+        if not bucket_entries:
+            raise ValueError("No bucket entries found for configured bucket_datasets.")
+
+        limit = data_cfg.get("limit")
+        if limit is not None:
+            bucket_entries = bucket_entries[: int(limit)]
+
+        include_metadata = extra_kwargs.get("include_metadata", False)
+        include_background = extra_kwargs.get("include_background", False)
+        blend_component_to_white = extra_kwargs.get("blend_component_to_white", False)
+
+        dataset = MixedBucketDataset(
+            root_dir=data_cfg.get("bucket_root", "data/rgba_layers"),
+            entries=bucket_entries,
+            include_metadata=include_metadata,
+            include_background=include_background,
+            blend_component_to_white=blend_component_to_white,
+            transform=transform,
+        )
+
+        batch_sampler = BucketBatchSampler(
+            dataset.bucket_to_indices,
             batch_size=data_cfg.get("batch_size", 4),
             shuffle=shuffle,
+            drop_last=bool(data_cfg.get("drop_last", False)),
+        )
+
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
             num_workers=data_cfg.get("num_workers", 4),
-            limit=data_cfg.get("limit"),
-            transform=transform,
-            dataset_kwargs=extra_kwargs,
+            pin_memory=True,
+            collate_fn=None,
         )
 
     ds = MultiLayerDataset(

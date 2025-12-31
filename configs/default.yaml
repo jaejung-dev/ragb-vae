@@ -1,16 +1,35 @@
 data:
   source: bucket  # bucket or multilayer
-  bucket_root: /home/ubuntu/jjseol/layer_data/qwen_rgba_layers
+  bucket_root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset
   bucket_split: train
+  bucket_val_split: val
+  bucket_datasets:
+    - type: components
+      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/lica_250k
+      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/lica_250k/metadata/manifest.json
+      # train/val 모두 사용
+    - type: prism_real
+      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_real
+      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_real/metadata/manifest.json
+      split: train
+      splits: [train]  # val에는 포함하지 않음
+    - type: prism_pro
+      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_pro
+      manifest: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/prism_layer_pro/metadata/manifest.json
+      split: train
+      splits: [train]
+      respect_manifest_split: false
+      use_fg_non_overlap: true
+      use_rep: true
+    - type: laion_rgb
+      root: /home/ubuntu/jjseol/lica-data-2/for_jjseol/rgba_dataset/laion1M_aethtetic
+      split: train
+      splits: [train]
   batch_size: 2
   num_workers: 4
   shuffle: true
-  background_blend_prob: 0.1
-  background_blend_targets:
-    - component
-    - composite
-  background_color_range: [0.3, 0.9]
-  background_sample_prob: 0.05
+  background_blend_prob: 0.0
+  background_sample_prob: 0.0
 
 training:
   stage: rgba_vae  # options: rgba_vae, decompose, refine
