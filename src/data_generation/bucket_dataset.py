@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from PIL import Image
+from PIL import Image, PngImagePlugin, UnidentifiedImageError
 from torch.utils.data import Dataset
 
 from .rgba_component_dataset import _pil_to_tensor
+
+# Allow PNG text/iCCP chunks up to this size (default 64MB) to avoid Pillow
+# safety guard failures on large embedded profiles in the dataset.
+PNG_TEXT_CHUNK_LIMIT = int(os.environ.get("PNG_MAX_TEXT_CHUNK", 64 * 1024 * 1024))
+if hasattr(PngImagePlugin, "MAX_TEXT_CHUNK"):
+    PngImagePlugin.MAX_TEXT_CHUNK = max(PngImagePlugin.MAX_TEXT_CHUNK, PNG_TEXT_CHUNK_LIMIT)
 
 
 def _load_json(path: Path) -> Any:
@@ -262,8 +269,18 @@ class MixedBucketDataset(Dataset):
         return len(self.entries)
 
     def _load_tensor(self, path: Path) -> Any:
-        img = Image.open(path).convert("RGBA")
-        return _pil_to_tensor(img)
+        try:
+            with Image.open(path) as img:
+                img_rgba = img.convert("RGBA")
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            # Expose the offending file path in the error for faster triage
+            if isinstance(exc, ValueError) and "MAX_TEXT_CHUNK" in str(exc):
+                raise RuntimeError(
+                    f"PNG text chunk too large (iCCP) in file: {path}. "
+                    f"Consider sanitizing the image or increasing PNG_MAX_TEXT_CHUNK."
+                ) from exc
+            raise RuntimeError(f"Failed to load image at {path}: {exc}") from exc
+        return _pil_to_tensor(img_rgba)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         entry = self.entries[index]

@@ -279,7 +279,6 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
     default_subfolder = "ae" if "flux" in base_arch else "vae"
     rgb_subfolder = model_cfg.get("rgb_subfolder")
     subfolder = default_subfolder if rgb_subfolder is None else rgb_subfolder
-
     model = RgbaVAE.from_pretrained_rgb(
         model_name_or_path=rgb_ckpt,
         subfolder=subfolder,
@@ -420,7 +419,7 @@ def train_rgba_vae(cfg: Dict[str, Any]) -> None:
         accelerator.print(f"[Params] trainable parameters: {trainable_params:,}")
     except Exception:
         pass
-
+    accelerator.print(torch_dtype)
     for epoch in range(epochs):
         progress_bar = tqdm(
             train_loader,
@@ -803,8 +802,40 @@ def save_validation_grid(
     step: Optional[int],
     output_dir: str,
 ) -> None:
+    def _composite_checkerboard(tensor: torch.Tensor, tile: int = 16) -> torch.Tensor:
+        """
+        Compose an RGBA tensor on a checkerboard background for visualization.
+        """
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        rgba = tensor
+        if rgba.shape[1] < 4:
+            alpha = torch.ones_like(rgba[:, :1])
+            rgba = torch.cat([rgba[:, :3], alpha], dim=1)
+        rgb = rgba[:, :3]
+        alpha = rgba[:, 3:4]
+
+        # Normalize if values are in [-1, 1]
+        if (rgb.min() < -0.01) or (rgb.max() > 1.01) or (alpha.min() < -0.01) or (alpha.max() > 1.01):
+            rgb = (rgb + 1.0) * 0.5
+            alpha = (alpha + 1.0) * 0.5
+
+        rgb = rgb.clamp(0.0, 1.0)
+        alpha = alpha.clamp(0.0, 1.0)
+
+        _, _, h, w = rgb.shape
+        y = torch.arange(h).view(-1, 1)
+        x = torch.arange(w).view(1, -1)
+        pattern = ((y // tile + x // tile) % 2).to(dtype=rgb.dtype)
+        pattern = pattern * 0.9 + 0.1  # light/dark squares
+        checker = pattern.unsqueeze(0).repeat(3, 1, 1)  # (3, H, W)
+        checker = checker.unsqueeze(0).repeat(rgb.shape[0], 1, 1, 1)
+
+        composed = rgb * alpha + checker * (1.0 - alpha)
+        return composed
+
     rows = len(samples)
-    columns = ("GT (white)", "Recon (white)", "GT (black)", "Recon (black)", "Alpha diff")
+    columns = ("GT (checkerboard)", "Recon (checkerboard)", "Alpha diff")
     fig, axes = plt.subplots(rows, len(columns), figsize=(4 * len(columns), 4 * rows))
     if rows == 1:
         axes = np.expand_dims(axes, axis=0)
@@ -813,13 +844,13 @@ def save_validation_grid(
         gt = sample["gt"]
         recon = sample["recon"]
         alpha_diff = torch.abs(gt[3:] - recon[3:])
+
         visuals = (
-            composite_over_white(gt.unsqueeze(0))[0],
-            composite_over_white(recon.unsqueeze(0))[0],
-            composite_over_black(gt.unsqueeze(0))[0],
-            composite_over_black(recon.unsqueeze(0))[0],
+            _composite_checkerboard(gt.unsqueeze(0))[0],
+            _composite_checkerboard(recon.unsqueeze(0))[0],
             alpha_diff.repeat(3, 1, 1),
         )
+
         for col, (title, tensor) in enumerate(zip(columns, visuals)):
             img = tensor.permute(1, 2, 0).cpu().numpy()
             img = np.clip(img, 0.0, 1.0)
