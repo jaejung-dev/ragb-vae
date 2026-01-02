@@ -31,7 +31,7 @@ data:
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
-  background_blend_prob: 0.1
+  background_blend_prob: 0.2
   background_blend_targets:
     - composite
   background_color_range: [0.3, 0.9]
