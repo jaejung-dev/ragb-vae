@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.training import train_decomposition, train_refine, train_rgba_vae
+from src.training.flux_kontext_textalpha_lora import train_from_config as train_kontext_textalpha_lora
 
 
 def main() -> None:
@@ -34,6 +35,8 @@ def main() -> None:
         train_decomposition(cfg)
     elif stage == "refine":
         train_refine(cfg)
+    elif stage == "kontext_textalpha_lora":
+        train_kontext_textalpha_lora(cfg)
     else:
         raise ValueError(f"Unknown training stage: {stage}")
 

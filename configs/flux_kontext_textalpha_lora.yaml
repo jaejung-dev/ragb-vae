@@ -1,0 +1,33 @@
+model:
+  pretrained_model_name_or_path: black-forest-labs/FLUX.1-Kontext-dev
+  hf_token: ${env:HUGGING_FACE_HUB_TOKEN}
+  rgba_vae_path: /home/ubuntu/ragb-vae/checkpoints/flux_rgba_vae/step_0015000
+  vae_subfolder: ae
+
+data:
+  root: /home/ubuntu/for_jjseol/inpainting_dataset/inpainting_250k_image_mask_pair/text
+  train_split: train
+  val_split: null
+  batch_size: 2
+  num_workers: 8
+  drop_last: true
+  interleave_buckets: true
+
+training:
+  stage: kontext_textalpha_lora
+  mixed_precision: bf16
+  grad_accum_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  max_train_steps: 10000
+  log_every: 50
+  save_every: 1000
+  output_dir: outputs/flux_kontext_textalpha_lora
+  rank: 96
+  lora_alpha: 128
+  max_grad_norm: 1.0
+  deepspeed_config: configs/deepspeed_zero2.json
+
