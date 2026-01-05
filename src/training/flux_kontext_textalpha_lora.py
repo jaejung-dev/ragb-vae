@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import json
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -89,11 +90,13 @@ def parse_args(args: list[str] | None = None, *, allow_missing: bool = False) ->
 
 
 def train(args: argparse.Namespace) -> None:
+    torch.set_float32_matmul_precision("medium")
     accelerator_kwargs = dict(
         gradient_accumulation_steps=args.grad_accum_steps,
         mixed_precision=args.mixed_precision,
     )
     ds_plugin = None
+    ds_config_path: Path | None = None
     if args.deepspeed_config:
         ds_config_path = Path(args.deepspeed_config)
         if not ds_config_path.is_absolute():
@@ -135,11 +138,14 @@ def train(args: argparse.Namespace) -> None:
         drop_last=args.drop_last,
         interleave=args.interleave_buckets,
     )
+    loader_kwargs: Dict[str, Any] = {"pin_memory": True}
+    if args.num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
     train_dl = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     val_dl: Optional[DataLoader] = None
     if val_ds is not None:
@@ -149,6 +155,7 @@ def train(args: argparse.Namespace) -> None:
             shuffle=True,
             num_workers=min(4, args.num_workers),
             pin_memory=True,
+            **({"persistent_workers": True, "prefetch_factor": 2} if min(4, args.num_workers) > 0 else {}),
         )
 
     # Optimizer & LR
@@ -165,6 +172,24 @@ def train(args: argparse.Namespace) -> None:
     transformer_wrapped, optimizer, train_dl = accelerator.prepare(model.transformer, optimizer, train_dl)
     model.transformer = transformer_wrapped
     model.to_device(device)
+
+    # Report effective batch sizes to avoid confusion between configs.
+    world_size = accelerator.num_processes
+    per_device_batch = args.batch_size
+    grad_accum = max(1, args.grad_accum_steps)
+    effective_global_batch = per_device_batch * grad_accum * max(1, world_size)
+    ds_micro = None
+    if ds_config_path is not None and ds_config_path.exists():
+        try:
+            with ds_config_path.open("r", encoding="utf-8") as f:
+                ds_cfg = json.load(f)
+            ds_micro = ds_cfg.get("train_micro_batch_size_per_gpu")
+        except Exception:
+            ds_micro = "unreadable"
+    accelerator.print(
+        "[Batch] per_device=%s grad_accum=%s world_size=%s effective_per_step=%s ds_micro=%s"
+        % (per_device_batch, grad_accum, world_size, effective_global_batch, ds_micro)
+    )
 
     total_steps = 0
     accelerator.print(f"[Train] {len(train_ds)} samples across {len(train_ds.bucket_to_indices)} buckets.")
@@ -250,10 +275,11 @@ def train(args: argparse.Namespace) -> None:
 
                 total_steps += 1
                 if pbar is not None:
+                    current_lr = optimizer.param_groups[0]["lr"]
                     pbar.update(1)
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
                 if accelerator.is_main_process and total_steps % args.log_every == 0:
-                    accelerator.print(f"[step {total_steps}] loss={loss.item():.4f}")
+                    accelerator.print(f"[step {total_steps}] loss={loss.item():.4f} lr={current_lr:.6f}")
 
                 if accelerator.is_main_process and args.save_every and total_steps % args.save_every == 0:
                     save_dir = Path(args.ckpt_dir) / f"checkpoint-{total_steps}"

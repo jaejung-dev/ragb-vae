@@ -1,16 +1,16 @@
 model:
   pretrained_model_name_or_path: black-forest-labs/FLUX.1-Kontext-dev
   hf_token: ${env:HUGGING_FACE_HUB_TOKEN}
-  rgba_vae_path: /home/ubuntu/for_jjseol/checkpoints/flux_rgba_vae/step_0032500/rgba_vae_hf
+  rgba_vae_path: /home/ubuntu/for_jjseol/checkpoints/flux_rgba_vae/step_004500/rgba_vae_hf
   vae_subfolder: ""
 
 data:
   root: /home/ubuntu/for_jjseol/inpainting_dataset/inpainting_250k_image_mask_pair/text
   train_split: train
   val_split: validation
-  batch_size: 1
+  batch_size: 8
   val_batch_size: 1
-  num_workers: 8
+  num_workers: 16
   drop_last: true
   interleave_buckets: true
 
@@ -18,24 +18,24 @@ training:
   stage: kontext_textalpha_lora
   mixed_precision: bf16
   grad_accum_steps: 1
-  learning_rate: 1.0e-4
+  learning_rate: 3.0e-5
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_eps: 1.0e-8
-  max_train_steps: 20000
+  max_train_steps: 100000
   log_every: 100
   save_every: 2000            # fallback if ckpt_every_steps not set
-  ckpt_every_steps: 10000
+  ckpt_every_steps: 5000
   ckpt_dir: checkpoints/flux_kontext_textalpha_lora
   output_dir: outputs/flux_kontext_textalpha_lora
   val_output_dir: outputs/flux_kontext_textalpha_lora/val_samples
-  val_every: 1000
+  val_every: 500
   val_max_samples: 10
   val_num_inference_steps: 20
   run_validation_on_start: true
-  rank: 96
-  lora_alpha: 128
+  rank: 128
+  lora_alpha: 192
   max_grad_norm: 1.0
   deepspeed_config: configs/deepspeed_zero2.json
 
