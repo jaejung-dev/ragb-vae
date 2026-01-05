@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DeepSpeedPlugin
@@ -15,10 +17,13 @@ from diffusers.training_utils import (
 )
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
+from PIL import Image
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from src.data_generation.text_alpha_bucket_dataset import BucketBatchSampler, TextAlphaBucketDataset
 from src.models import (
+    FluxTextAlphaModel,
     encode_empty_prompt,
     load_rgba_vae_from_path,
     load_scheduler,
@@ -26,16 +31,35 @@ from src.models import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def _resolve_env_token(value: str | None) -> str | None:
+    """
+    Expand ${env:VAR_NAME} placeholders from YAML into real env values.
+    Returns None if the placeholder is missing or the env var is unset.
+    """
+    if value is None:
+        return None
+    if value.startswith("${env:") and value.endswith("}"):
+        env_name = value[len("${env:") : -1]
+        return os.environ.get(env_name)
+    return value
+
+
+def parse_args(args: list[str] | None = None, *, allow_missing: bool = False) -> argparse.Namespace:
+    """
+    `allow_missing=True` lets config-driven runs fetch defaults without argparse
+    exiting on required fields. CLI usage keeps required checks.
+    """
     parser = argparse.ArgumentParser(description="FLUX-Kontext LoRA for text_alpha latent prediction.")
-    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    required = not allow_missing
+    parser.add_argument("--pretrained_model_name_or_path", type=str, required=required, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
-    parser.add_argument("--rgba_vae_path", type=str, required=True)
+    parser.add_argument("--rgba_vae_path", type=str, required=required, default=None)
     parser.add_argument("--vae_subfolder", type=str, default="ae")
-    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--data_root", type=str, required=required, default=None)
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--val_batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -45,7 +69,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_train_steps", type=int, default=10000)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints/flux_kontext_textalpha_lora")
     parser.add_argument("--output_dir", type=str, default="outputs/flux_kontext_textalpha_lora")
+    parser.add_argument("--val_output_dir", type=str, default="outputs/flux_kontext_textalpha_lora/val_samples")
+    parser.add_argument("--val_every", type=int, default=1000)
+    parser.add_argument("--val_max_samples", type=int, default=100)
+    parser.add_argument("--val_num_inference_steps", type=int, default=20)
+    parser.add_argument("--run_validation_on_start", action="store_true")
     parser.add_argument("--mixed_precision", type=str, default="bf16")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1337)
@@ -55,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop_last", action="store_true")
     parser.add_argument("--interleave_buckets", action="store_true")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -79,7 +109,7 @@ def train(args: argparse.Namespace) -> None:
 
     torch.manual_seed(args.seed + accelerator.process_index)
 
-    token = args.hf_token or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = _resolve_env_token(args.hf_token) or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     weight_dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16
 
     model = FluxTextAlphaModel(
@@ -94,6 +124,10 @@ def train(args: argparse.Namespace) -> None:
 
     # Datasets
     train_ds = TextAlphaBucketDataset(Path(args.data_root), split=args.train_split)
+    val_ds: Optional[TextAlphaBucketDataset] = None
+    if args.val_split:
+        val_ds = TextAlphaBucketDataset(Path(args.data_root), split=args.val_split)
+
     train_sampler = BucketBatchSampler(
         train_ds.bucket_to_indices,
         batch_size=args.batch_size,
@@ -107,6 +141,15 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    val_dl: Optional[DataLoader] = None
+    if val_ds is not None:
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=args.val_batch_size,
+            shuffle=True,
+            num_workers=min(4, args.num_workers),
+            pin_memory=True,
+        )
 
     # Optimizer & LR
     params_to_optimize = model.lora_parameters()
@@ -124,10 +167,73 @@ def train(args: argparse.Namespace) -> None:
     model.to_device(device)
 
     total_steps = 0
-    accelerator.print(f"[Buckets] {len(train_ds.bucket_to_indices)} buckets, {len(train_ds)} samples.")
-    progress = range(args.max_train_steps)
+    accelerator.print(f"[Train] {len(train_ds)} samples across {len(train_ds.bucket_to_indices)} buckets.")
+    if val_ds is not None:
+        accelerator.print(f"[Val]   {len(val_ds)} samples.")
+    else:
+        accelerator.print("[Val]   (disabled: no val_split provided)")
 
-    for step in progress:
+    pbar = None
+    if accelerator.is_local_main_process:
+        pbar = tqdm(total=args.max_train_steps, desc="train", dynamic_ncols=True)
+        Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    def _rgba_to_uint8(tensor: torch.Tensor) -> np.ndarray:
+        return (
+            tensor.clamp(0, 1)
+            .permute(1, 2, 0)
+            .to(torch.float32, copy=True)
+            .cpu()
+            .numpy()
+            * 255
+        ).astype(np.uint8)
+
+    def _save_pair(gt_tensor: torch.Tensor, pred_tensor: torch.Tensor, path: Path) -> None:
+        gt_img = Image.fromarray(_rgba_to_uint8(gt_tensor), mode="RGBA")
+        pred_img = Image.fromarray(_rgba_to_uint8(pred_tensor), mode="RGBA")
+        w, h = gt_img.size
+        canvas = Image.new("RGBA", (w * 2, h))
+        canvas.paste(gt_img, (0, 0))
+        canvas.paste(pred_img, (w, 0))
+        canvas.save(path)
+
+    def run_validation(step_label: str) -> None:
+        if val_dl is None or not accelerator.is_main_process:
+            return
+        model.transformer.eval()
+        out_dir = Path(args.val_output_dir) / f"step-{step_label}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        saved = 0
+        max_samples = args.val_max_samples
+        val_total_batches = min(len(val_dl), (max_samples + args.val_batch_size - 1) // args.val_batch_size)
+        vbar = tqdm(total=val_total_batches, desc=f"val-{step_label}", dynamic_ncols=True)
+        with torch.no_grad():
+            for batch in val_dl:
+                if saved >= max_samples:
+                    break
+                gt = batch["gt"].to(device, dtype=model.vae.dtype)
+                decoded = model.sample(gt, num_inference_steps=args.val_num_inference_steps)
+
+                names = batch.get("sample_name", ["val"])
+                if isinstance(names, str):
+                    names = [names]
+
+                for i in range(decoded.shape[0]):
+                    if saved >= max_samples:
+                        break
+                    name = names[i] if i < len(names) else f"val_{saved}"
+                    _save_pair(gt[i], decoded[i], out_dir / f"{name}_pair.png")
+                    saved += 1
+                vbar.update(1)
+        model.transformer.train()
+        vbar.close()
+
+    # Initial sanity-check validation
+    if args.run_validation_on_start:
+        run_validation("start")
+
+    while total_steps < args.max_train_steps:
         for batch in train_dl:
             with accelerator.accumulate(model.transformer):
                 gt = batch["gt"]
@@ -143,11 +249,14 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
 
                 total_steps += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
                 if accelerator.is_main_process and total_steps % args.log_every == 0:
                     accelerator.print(f"[step {total_steps}] loss={loss.item():.4f}")
 
                 if accelerator.is_main_process and args.save_every and total_steps % args.save_every == 0:
-                    save_dir = Path(args.output_dir) / f"checkpoint-{total_steps}"
+                    save_dir = Path(args.ckpt_dir) / f"checkpoint-{total_steps}"
                     save_dir.mkdir(parents=True, exist_ok=True)
                     lora_state = model.lora_state_dict()
                     FluxPipeline.save_lora_weights(
@@ -155,13 +264,19 @@ def train(args: argparse.Namespace) -> None:
                         transformer_lora_layers=lora_state,
                     )
 
+                # Run validation on schedule
+                if args.val_every and total_steps % args.val_every == 0 and total_steps > 0:
+                    run_validation(str(total_steps))
+
                 if total_steps >= args.max_train_steps:
                     break
-        if total_steps >= args.max_train_steps:
-            break
+        # allow re-iteration over the dataloader until max steps are reached
+
+    if pbar is not None:
+        pbar.close()
 
     if accelerator.is_main_process:
-        final_dir = Path(args.output_dir) / "final"
+        final_dir = Path(args.ckpt_dir) / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
         unwrapped = accelerator.unwrap_model(model.transformer)
         lora_state = get_peft_model_state_dict(unwrapped)
@@ -177,7 +292,7 @@ def build_args_from_cfg(cfg: Dict[str, Any]) -> argparse.Namespace:
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("training", {})
 
-    defaults = parse_args()
+    defaults = parse_args(args=[], allow_missing=True)
     # Build a namespace manually to avoid argparse re-parsing
     args = argparse.Namespace(**vars(defaults))
 
@@ -185,7 +300,7 @@ def build_args_from_cfg(cfg: Dict[str, Any]) -> argparse.Namespace:
     if model_cfg.get("pretrained_model_name_or_path"):
         args.pretrained_model_name_or_path = model_cfg["pretrained_model_name_or_path"]
     if model_cfg.get("hf_token"):
-        args.hf_token = model_cfg["hf_token"]
+        args.hf_token = _resolve_env_token(model_cfg.get("hf_token"))
     if model_cfg.get("rgba_vae_path"):
         args.rgba_vae_path = model_cfg["rgba_vae_path"]
     if model_cfg.get("vae_subfolder") is not None:
@@ -200,6 +315,8 @@ def build_args_from_cfg(cfg: Dict[str, Any]) -> argparse.Namespace:
         args.val_split = data_cfg["val_split"]
     if data_cfg.get("batch_size") is not None:
         args.batch_size = int(data_cfg["batch_size"])
+    if data_cfg.get("val_batch_size") is not None:
+        args.val_batch_size = int(data_cfg["val_batch_size"])
     if data_cfg.get("num_workers") is not None:
         args.num_workers = int(data_cfg["num_workers"])
     if data_cfg.get("drop_last") is not None:
@@ -228,8 +345,26 @@ def build_args_from_cfg(cfg: Dict[str, Any]) -> argparse.Namespace:
         args.log_every = int(train_cfg["log_every"])
     if train_cfg.get("save_every") is not None:
         args.save_every = int(train_cfg["save_every"])
+    if train_cfg.get("ckpt_every_steps") is not None:
+        args.save_every = int(train_cfg["ckpt_every_steps"])
+    if train_cfg.get("ckpt_dir") is not None:
+        args.ckpt_dir = str(train_cfg["ckpt_dir"])
     if train_cfg.get("output_dir") is not None:
         args.output_dir = str(train_cfg["output_dir"])
+    if train_cfg.get("val_output_dir") is not None:
+        args.val_output_dir = str(train_cfg["val_output_dir"])
+    if train_cfg.get("val_every") is not None:
+        args.val_every = int(train_cfg["val_every"])
+    if train_cfg.get("val_every_steps") is not None:
+        args.val_every = int(train_cfg["val_every_steps"])
+    if train_cfg.get("val_max_samples") is not None:
+        args.val_max_samples = int(train_cfg["val_max_samples"])
+    if train_cfg.get("val_max_batches") is not None:
+        args.val_max_samples = int(train_cfg["val_max_batches"]) * args.val_batch_size
+    if train_cfg.get("val_num_inference_steps") is not None:
+        args.val_num_inference_steps = int(train_cfg["val_num_inference_steps"])
+    if train_cfg.get("run_validation_on_start") is not None:
+        args.run_validation_on_start = bool(train_cfg["run_validation_on_start"])
     if train_cfg.get("rank") is not None:
         args.rank = int(train_cfg["rank"])
     if train_cfg.get("lora_alpha") is not None:
@@ -240,6 +375,16 @@ def build_args_from_cfg(cfg: Dict[str, Any]) -> argparse.Namespace:
         args.deepspeed_config = train_cfg["deepspeed_config"]
     if train_cfg.get("seed") is not None:
         args.seed = int(train_cfg["seed"])
+
+    missing = []
+    if not args.pretrained_model_name_or_path:
+        missing.append("model.pretrained_model_name_or_path")
+    if not args.rgba_vae_path:
+        missing.append("model.rgba_vae_path")
+    if not args.data_root:
+        missing.append("data.root")
+    if missing:
+        raise ValueError(f"Missing required config fields: {', '.join(missing)}")
 
     return args
 

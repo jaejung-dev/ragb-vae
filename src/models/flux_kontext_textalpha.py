@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler, FluxPipeline, FluxTransformer2DModel
-from diffusers.models.autoencoders.vae import AutoencoderKL
+from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxPipeline, FluxTransformer2DModel
+from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings
 from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
@@ -14,6 +14,7 @@ from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from src.models.rgba_vae import _maybe_restore_rgba_convs, adapt_vae_to_rgba
 
 # ---------------------------------------------------------------------------
 # Low-level loaders
@@ -58,11 +59,28 @@ def load_rgba_vae_from_path(
     subfolder: str = "ae",
     dtype: torch.dtype = torch.float32,
 ) -> AutoencoderKL:
-    return AutoencoderKL.from_pretrained(
+    """
+    Load an RGBA-ready VAE checkpoint.
+
+    - If the saved config is still RGB (in/out_channels=3), transparently widen to 4
+      channels and restore RGBA weights when present.
+    - Uses ignore_mismatched_sizes to avoid shape errors when weights are already RGBA.
+    """
+    vae = AutoencoderKL.from_pretrained(
         vae_path,
         subfolder=subfolder,
         torch_dtype=dtype,
+        ignore_mismatched_sizes=True,
+        low_cpu_mem_usage=False,
     )
+    in_c = getattr(vae.config, "in_channels", None)
+    out_c = getattr(vae.config, "out_channels", None)
+    if in_c == 3 or out_c == 3:
+        adapt_vae_to_rgba(vae, alpha_bias_init=0.0)
+        _maybe_restore_rgba_convs(vae, vae_path, subfolder)
+        vae.config.in_channels = 4
+        vae.config.out_channels = 4
+    return vae
 
 
 def encode_empty_prompt(
@@ -116,9 +134,16 @@ def encode_empty_prompt(
         prompt_embeds_2 = text_encoder_two(**text_inputs_two).last_hidden_state
         pooled = text_encoder_one.text_model.final_layer_norm(prompt_embeds)[:, 0]
 
-    prompt = torch.cat([prompt_embeds, prompt_embeds_2], dim=1)
-    txt_ids = torch.cat([text_inputs_one.input_ids, text_inputs_two.input_ids], dim=1)
-    return prompt, pooled, txt_ids
+    # FLUX-Kontext uses two encoders with different hidden sizes (CLIP: 768, T5: 4096).
+    # If the hidden dims mismatch, fall back to using the T5 stream only to avoid cat errors.
+    if prompt_embeds.shape[-1] == prompt_embeds_2.shape[-1]:
+        prompt = torch.cat([prompt_embeds, prompt_embeds_2], dim=1)
+    else:
+        prompt = prompt_embeds_2
+
+    # FLUX expects txt_ids as positional ids of shape (seq_len, 3) without a batch dim.
+    text_ids = torch.zeros(prompt.shape[1], 3, device=device, dtype=prompt.dtype)
+    return prompt, pooled, text_ids
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +212,13 @@ class FluxTextAlphaModel:
         token: Optional[str] = None,
         device: torch.device = torch.device("cpu"),
         weight_dtype: torch.dtype = torch.float32,
+        use_gradient_checkpointing: bool = True,
     ) -> None:
         self.device = device
         self.weight_dtype = weight_dtype
+        # Default embedded guidance scale used by FLUX guidance-distilled checkpoints.
+        # Matches the diffusers pipeline default (3.5) unless overridden manually.
+        self.guidance_scale = 3.5
 
         self.transformer = load_transformer(model_id, token=token, dtype=weight_dtype)
         self.vae = load_rgba_vae_from_path(vae_path, subfolder=vae_subfolder, dtype=weight_dtype)
@@ -202,8 +231,12 @@ class FluxTextAlphaModel:
         self.scaling_factor = float(getattr(self.vae.config, "scaling_factor", 0.18215))
         self.shift_factor = float(getattr(self.vae.config, "shift_factor", 0.0))
 
+        if use_gradient_checkpointing and hasattr(self.transformer, "enable_gradient_checkpointing"):
+            # Reduce activation memory; critical for LoRA fine-tuning at higher resolutions.
+            self.transformer.enable_gradient_checkpointing()
+
         self.to_device(device)
-        self.scheduler.set_timesteps(self.scheduler.config.num_train_timesteps, device=device)
+        self._set_timesteps(device, num_train_timesteps=self.scheduler.config.num_train_timesteps)
 
     # ----------------------------
     # Device / adapters
@@ -216,7 +249,65 @@ class FluxTextAlphaModel:
         self.pooled_prompt_embeds = self.pooled_prompt_embeds.to(device)
         self.text_ids = self.text_ids.to(device)
         # timesteps need to match device
-        self.scheduler.set_timesteps(self.scheduler.config.num_train_timesteps, device=device)
+        self._set_timesteps(device)
+
+    def _calc_mu(self, seq_len: Optional[int] = None) -> Optional[float]:
+        cfg = self.scheduler.config
+        if not getattr(cfg, "use_dynamic_shifting", False):
+            return None
+
+        base_seq = getattr(cfg, "base_image_seq_len", 256) or 256
+        max_seq = getattr(cfg, "max_image_seq_len", 4096) or 4096
+        base_shift = getattr(cfg, "base_shift", 0.5) or 0.5
+        max_shift = getattr(cfg, "max_shift", 1.15) or 1.15
+
+        # Estimate sequence length if not provided:
+        # use VAE sample_size reduced by scale factor; clamp to config bounds.
+        if seq_len is None:
+            sample_size = getattr(self.vae.config, "sample_size", 256) or 256
+            h = max(int(sample_size // self.vae_scale_factor), 1)
+            seq_len = h * h
+        seq_len = int(seq_len)
+        seq_len = max(min(seq_len, max_seq), base_seq)
+
+        m = (max_shift - base_shift) / (max_seq - base_seq)
+        b = base_shift - m * base_seq
+        return float(seq_len * m + b)
+
+    def _set_timesteps(self, device: torch.device, *, num_train_timesteps: Optional[int] = None) -> None:
+        mu = self._calc_mu()
+        num_steps = num_train_timesteps or self.scheduler.config.num_train_timesteps
+        self.scheduler.set_timesteps(num_steps, device=device, mu=mu)
+
+    def _unwrap_transformer(self):
+        """
+        Return the base transformer module (handles Accelerator/DeepSpeed wrappers).
+        """
+        if hasattr(self.transformer, "module"):
+            return self.transformer.module
+        return self.transformer
+
+    def _transformer_config(self):
+        """
+        Return the underlying transformer config even if wrapped by Accelerator/DeepSpeed.
+        """
+        base = self._unwrap_transformer()
+        if hasattr(base, "config"):
+            return base.config
+        return None
+
+    def _prepare_guidance(self, batch_size: int, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """Return a guidance tensor when the transformer expects guidance embeddings."""
+        cfg = self._transformer_config()
+        base = self._unwrap_transformer()
+        time_embed = getattr(base, "time_text_embed", None)
+        guidance_needed = getattr(cfg, "guidance_embeds", False) or isinstance(
+            time_embed, CombinedTimestepGuidanceTextProjEmbeddings
+        )
+        if not guidance_needed:
+            return None
+        scale = float(getattr(self, "guidance_scale", 3.5))
+        return torch.full((batch_size,), scale, device=self.device, dtype=dtype)
 
     def add_lora(self, rank: int, lora_alpha: int) -> None:
         add_lora_to_transformer(self.transformer, rank=rank, lora_alpha=lora_alpha)
@@ -237,28 +328,22 @@ class FluxTextAlphaModel:
         latents = self.vae.encode((x * 2.0 - 1.0)).latent_dist.sample()
         return (latents - self.shift_factor) * self.scaling_factor
 
-    def _pack(
-        self,
-        cond_latent: torch.Tensor,
-        target_latent: torch.Tensor,
-    ) -> torch.Tensor:
-        combined = torch.cat([cond_latent, target_latent], dim=1)
+    def _pack_latent(self, latent: torch.Tensor) -> torch.Tensor:
         return FluxPipeline._pack_latents(
-            combined,
-            batch_size=combined.shape[0],
-            num_channels_latents=combined.shape[1],
-            height=combined.shape[2],
-            width=combined.shape[3],
+            latent,
+            batch_size=latent.shape[0],
+            num_channels_latents=latent.shape[1],
+            height=latent.shape[2],
+            width=latent.shape[3],
         )
 
-    def _unpack_target(self, model_pred: torch.Tensor, cond_channels: int, height: int, width: int) -> torch.Tensor:
-        unpacked = FluxPipeline._unpack_latents(
-            model_pred,
-            height=height * self.vae_scale_factor,
-            width=width * self.vae_scale_factor,
+    def _unpack_target(self, model_pred_tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        return FluxPipeline._unpack_latents(
+            model_pred_tokens,
+            height=height,
+            width=width,
             vae_scale_factor=self.vae_scale_factor,
         )
-        return unpacked[:, cond_channels:, ...]
 
     # ----------------------------
     # Training loss
@@ -281,28 +366,32 @@ class FluxTextAlphaModel:
             logit_std=1.0,
             mode_scale=1.0,
         )
-        indices = (u * self.scheduler.config.num_train_timesteps).long().clamp(
-            max=self.scheduler.config.num_train_timesteps - 1
-        )
+        indices = (u * self.scheduler.config.num_train_timesteps).long()
+        # Guard against rare out-of-range indices -> clamp by actual buffer lengths.
+        max_idx = min(self.scheduler.timesteps.shape[0] - 1, self.scheduler.sigmas.shape[0] - 1)
+        indices = indices.clamp(max=max_idx)
+
         timesteps = self.scheduler.timesteps[indices].to(self.device)
         sigmas = self.scheduler.sigmas.to(device=self.device, dtype=target_latent.dtype)[indices]
         while len(sigmas.shape) < target_latent.ndim:
             sigmas = sigmas.unsqueeze(-1)
 
         noisy_target = (1.0 - sigmas) * target_latent + sigmas * noise
-        packed = self._pack(cond_latent, noisy_target)
-        latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-            packed.shape[0],
-            packed.shape[2] // 2,
-            packed.shape[3] // 2,
-            self.device,
-            packed.dtype,
+        packed_cond = self._pack_latent(cond_latent)
+        packed_tgt = self._pack_latent(noisy_target)
+        packed = torch.cat([packed_cond, packed_tgt], dim=1)
+        latent_h, latent_w = target_latent.shape[2], target_latent.shape[3]
+        latent_image_ids_single = FluxPipeline._prepare_latent_image_ids(
+            packed.shape[0], latent_h // 2, latent_w // 2, self.device, packed.dtype
         )
+        latent_image_ids = torch.cat([latent_image_ids_single, latent_image_ids_single], dim=0)
+
+        guidance = self._prepare_guidance(bsz, target_latent.dtype)
 
         model_pred = self.transformer(
             hidden_states=packed,
             timestep=timesteps / 1000,
-            guidance=None,
+            guidance=guidance,
             pooled_projections=self.pooled_prompt_embeds,
             encoder_hidden_states=self.prompt_embeds,
             txt_ids=self.text_ids,
@@ -310,8 +399,9 @@ class FluxTextAlphaModel:
             return_dict=False,
         )[0]
 
-        cond_c = cond_latent.shape[1]
-        model_pred_target = self._unpack_target(model_pred, cond_c, target_latent.shape[2], target_latent.shape[3])
+        seq_len_cond = packed_cond.shape[1]
+        model_pred_tgt_tokens = model_pred[:, seq_len_cond:, :]
+        model_pred_target = self._unpack_target(model_pred_tgt_tokens, gt.shape[2], gt.shape[3])
         loss_target = noise - target_latent
 
         weighting = compute_loss_weighting_for_sd3(
@@ -346,10 +436,20 @@ class FluxTextAlphaModel:
         cond_latent = self._encode_latents(gt)
 
         # Prepare scheduler for inference steps
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self._set_timesteps(self.device, num_train_timesteps=num_inference_steps)
 
-        latents = torch.randn_like(cond_latent, generator=generator)
+        if generator is None:
+            latents = torch.randn_like(cond_latent)
+        else:
+            latents = torch.randn(
+                cond_latent.shape,
+                device=self.device,
+                dtype=cond_latent.dtype,
+                generator=generator,
+            )
         cond_c = cond_latent.shape[1]
+        bsz = gt.shape[0]
+        guidance = self._prepare_guidance(bsz, latents.dtype)
 
         for timestep in self.scheduler.timesteps:
             sigmas = self.scheduler.sigmas.to(device=self.device, dtype=latents.dtype)
@@ -358,19 +458,22 @@ class FluxTextAlphaModel:
                 sigma = sigma.unsqueeze(-1)
 
             noisy_target = (1.0 - sigma) * latents + sigma * torch.randn_like(latents)
-            packed = self._pack(cond_latent, noisy_target)
-            latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                packed.shape[0],
-                packed.shape[2] // 2,
-                packed.shape[3] // 2,
-                self.device,
-                packed.dtype,
+            packed_cond = self._pack_latent(cond_latent)
+            packed_tgt = self._pack_latent(noisy_target)
+            packed = torch.cat([packed_cond, packed_tgt], dim=1)
+            latent_h, latent_w = latents.shape[2], latents.shape[3]
+            latent_image_ids_single = FluxPipeline._prepare_latent_image_ids(
+                packed.shape[0], latent_h // 2, latent_w // 2, self.device, packed.dtype
             )
+            latent_image_ids = torch.cat([latent_image_ids_single, latent_image_ids_single], dim=0)
+
+            # Expand scalar timestep to per-example 1D tensor as expected by diffusers embeddings.
+            timestep_batched = timestep.expand(latents.shape[0]).to(latents.dtype)
 
             model_pred = self.transformer(
                 hidden_states=packed,
-                timestep=timestep / 1000,
-                guidance=None,
+                timestep=timestep_batched / 1000,
+                guidance=guidance,
                 pooled_projections=self.pooled_prompt_embeds,
                 encoder_hidden_states=self.prompt_embeds,
                 txt_ids=self.text_ids,
@@ -378,7 +481,9 @@ class FluxTextAlphaModel:
                 return_dict=False,
             )[0]
 
-            model_pred_target = self._unpack_target(model_pred, cond_c, latents.shape[2], latents.shape[3])
+            seq_len_cond = packed_cond.shape[1]
+            model_pred_tgt_tokens = model_pred[:, seq_len_cond:, :]
+            model_pred_target = self._unpack_target(model_pred_tgt_tokens, gt.shape[2], gt.shape[3])
             latents = self.scheduler.step(
                 model_pred_target,
                 timestep,
