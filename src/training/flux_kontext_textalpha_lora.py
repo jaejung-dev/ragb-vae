@@ -45,6 +45,37 @@ def _resolve_env_token(value: str | None) -> str | None:
     return value
 
 
+def _dtype_to_str(dtype: torch.dtype) -> str:
+    if dtype is torch.bfloat16:
+        return "torch.bfloat16"
+    if dtype is torch.float16:
+        return "torch.float16"
+    if dtype is torch.float32:
+        return "torch.float32"
+    return str(dtype)
+
+
+def _write_lora_metadata(save_dir: Path, *, step: int | str, args: argparse.Namespace, dtype: torch.dtype) -> None:
+    """
+    Persist lightweight metadata next to LoRA weights so inference can auto-read rank/alpha/etc.
+    """
+    meta = {
+        "model_id": args.pretrained_model_name_or_path,
+        "revision": None,
+        "adapter_name": "default",
+        "rank": int(args.rank),
+        "alpha": int(args.lora_alpha),
+        "dropout": 0.0,
+        "dtype": _dtype_to_str(dtype),
+        "step": step,
+        "weights": "pytorch_lora_weights.safetensors",
+    }
+    metadata_path = save_dir / "metadata.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
 def parse_args(args: list[str] | None = None, *, allow_missing: bool = False) -> argparse.Namespace:
     """
     `allow_missing=True` lets config-driven runs fetch defaults without argparse
@@ -289,6 +320,7 @@ def train(args: argparse.Namespace) -> None:
                         save_dir,
                         transformer_lora_layers=lora_state,
                     )
+                    _write_lora_metadata(save_dir, step=total_steps, args=args, dtype=weight_dtype)
 
                 # Run validation on schedule
                 if args.val_every and total_steps % args.val_every == 0 and total_steps > 0:
@@ -310,6 +342,7 @@ def train(args: argparse.Namespace) -> None:
             final_dir,
             transformer_lora_layers=lora_state,
         )
+        _write_lora_metadata(final_dir, step=args.max_train_steps, args=args, dtype=weight_dtype)
     accelerator.print("Done.")
 
 

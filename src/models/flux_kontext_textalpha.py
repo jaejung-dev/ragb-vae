@@ -192,6 +192,9 @@ def load_lora_weights_into_transformer(
     add_lora_to_transformer(transformer, rank=rank, lora_alpha=lora_alpha, adapter_name=adapter_name)
     lora_state = FluxPipeline.lora_state_dict(lora_dir)
     transformer.load_state_dict(lora_state, strict=False)
+    # Ensure the loaded adapter is active for inference.
+    if hasattr(transformer, "set_adapter"):
+        transformer.set_adapter(adapter_name)
 
 
 # ---------------------------------------------------------------------------
